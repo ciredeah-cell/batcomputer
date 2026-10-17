@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; font-src 'self';" />
+  <title>Laguna Deck</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- ───────────────────────── drivers rail ───────────────────────── -->
+    <aside id="rail">
+      <header class="rail-head">
+        <div class="brand">
+          <span class="brand-mark"></span>
+          <div>
+            <div class="brand-name">Laguna Deck</div>
+            <div class="brand-sub" id="hwLine">probing hardware…</div>
+          </div>
+        </div>
+      </header>
+
+      <section class="rail-section">
+        <div class="rail-title">
+          <span>Local models</span>
+          <button class="icon-btn" id="btnAddModel" title="Add a GGUF model">+</button>
+        </div>
+        <ul class="driver-list" id="modelList"></ul>
+        <button class="ghost-btn" id="btnScanModels">Scan a models folder…</button>
+      </section>
+
+      <section class="rail-section">
+        <div class="rail-title"><span>Cloud agents</span></div>
+        <ul class="driver-list" id="cliList">
+          <li class="driver" data-cli="claude">
+            <span class="dot" id="dotClaude"></span>
+            <div class="driver-body">
+              <div class="driver-name">Claude Code</div>
+              <div class="driver-meta" id="metaClaude">checking…</div>
+            </div>
+          </li>
+          <li class="driver" data-cli="copilot">
+            <span class="dot" id="dotCopilot"></span>
+            <div class="driver-body">
+              <div class="driver-name">GitHub Copilot</div>
+              <div class="driver-meta" id="metaCopilot">checking…</div>
+            </div>
+          </li>
+        </ul>
+      </section>
+
+      <section class="rail-section rail-foot">
+        <label class="field">
+          <span>Workspace</span>
+          <button class="path-btn" id="btnWorkspace" title="Every tool call and agent session runs here">—</button>
+        </label>
+        <label class="field">
+          <span>Approvals</span>
+          <select id="approvalMode">
+            <option value="ask">Ask before writes and commands</option>
+            <option value="acceptEdits">Auto-accept file edits</option>
+            <option value="yolo">Auto-accept everything safe-ish</option>
+          </select>
+        </label>
+        <div class="rail-buttons">
+          <button class="ghost-btn" id="btnSettings">Settings</button>
+          <button class="ghost-btn" id="btnDeckToggle">Deck</button>
+        </div>
+      </section>
+    </aside>
+
+    <!-- ───────────────────────── conversation ───────────────────────── -->
+    <main id="main">
+      <header id="topbar">
+        <div class="active-driver">
+          <span class="dot" id="activeDot"></span>
+          <div>
+            <div class="active-name" id="activeName">No driver selected</div>
+            <div class="active-meta" id="activeMeta">Pick a local model, or launch Claude Code or Copilot</div>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button class="pill-btn" id="btnLaunch" hidden>Launch</button>
+          <button class="pill-btn" id="btnOpenTerminal" hidden title="Open this agent in a real terminal with its full interface">Terminal</button>
+          <button class="pill-btn" id="btnUnload" hidden>Unload</button>
+          <button class="pill-btn danger" id="btnStop" hidden>Stop</button>
+          <button class="pill-btn" id="btnNewChat">New chat</button>
+        </div>
+      </header>
+
+      <div id="transcript">
+        <div class="empty-state" id="emptyState">
+          <h1>One deck, every driver.</h1>
+          <p>
+            Load a GGUF with llama.cpp and the deck plans the offload for you, or hand the turn to
+            Claude Code or GitHub Copilot — same chat, same workspace, same approval rules.
+          </p>
+          <ol class="getting-started">
+            <li><b>Point it at llama-server</b> — Settings → llama.cpp binary.</li>
+            <li><b>Add Laguna XS</b> — the <span class="kbd">+</span> next to Local models, or scan a folder.</li>
+            <li><b>Check the Deck panel</b> — it shows whether the model plus its KV cache fits the graphics carve-out, and what to change if it doesn't.</li>
+            <li><b>Load and talk.</b> Tool calls appear as cards you approve or deny.</li>
+          </ol>
+        </div>
+      </div>
+
+      <div id="approvalTray"></div>
+
+      <footer id="composer">
+        <div class="composer-row">
+          <textarea id="input" rows="1" placeholder="Ask the current driver to do something…  (Enter to send, Shift+Enter for a newline)"></textarea>
+          <button id="btnSend" class="send-btn" title="Send">Send</button>
+        </div>
+        <div class="composer-meta">
+          <span id="turnStats"></span>
+          <span id="composerHint"></span>
+        </div>
+      </footer>
+    </main>
+
+    <!-- ──────────────────────────── deck panel ─────────────────────── -->
+    <aside id="deck">
+      <div class="deck-tabs">
+        <button class="tab active" data-tab="budget">Budget</button>
+        <button class="tab" data-tab="profile">Offload</button>
+        <button class="tab" data-tab="log">Server log</button>
+      </div>
+
+      <section class="deck-pane active" data-pane="budget">
+        <div class="meter-wrap">
+          <div class="meter-label"><span>GPU memory budget</span><span id="budgetNums">—</span></div>
+          <div class="meter" id="meter">
+            <div class="seg seg-weights" id="segWeights"></div>
+            <div class="seg seg-kv" id="segKV"></div>
+            <div class="seg seg-overhead" id="segOverhead"></div>
+          </div>
+          <div class="meter-key">
+            <span><i class="sw seg-weights"></i>weights</span>
+            <span><i class="sw seg-kv"></i>KV cache</span>
+            <span><i class="sw seg-overhead"></i>compute</span>
+          </div>
+        </div>
+        <dl class="stat-grid" id="statGrid"></dl>
+        <div id="adviceList"></div>
+        <div class="deck-note" id="hwNote"></div>
+      </section>
+
+      <section class="deck-pane" data-pane="profile">
+        <div id="profileForm" class="profile-form">
+          <p class="deck-note">Select a local model to edit its launch profile.</p>
+        </div>
+      </section>
+
+      <section class="deck-pane" data-pane="log">
+        <pre id="serverLog" class="log"></pre>
+      </section>
+    </aside>
+  </div>
+
+  <!-- ───────────────────────────── settings ──────────────────────────── -->
+  <div id="settingsModal" class="modal" hidden>
+    <div class="modal-card">
+      <header class="modal-head">
+        <h2>Settings</h2>
+        <button class="icon-btn" id="btnCloseSettings">×</button>
+      </header>
+      <div class="modal-body">
+        <h3>llama.cpp</h3>
+        <label class="field row">
+          <span>llama-server binary</span>
+          <button class="path-btn" id="btnLlamaPath">—</button>
+        </label>
+        <label class="field row">
+          <span>Backend</span>
+          <select id="llamaBackend">
+            <option value="vulkan">Vulkan (default on AMD/Intel iGPU)</option>
+            <option value="rocm">ROCm / HIP (sets ROCBLAS_USE_HIPBLASLT=1)</option>
+            <option value="cpu">CPU only</option>
+          </select>
+        </label>
+        <label class="field row">
+          <span>GPU memory budget (GiB)</span>
+          <input type="number" id="gpuBudget" min="1" max="512" step="1" />
+        </label>
+        <p class="hint" id="budgetHint"></p>
+
+        <h3>Claude Code</h3>
+        <label class="field row">
+          <span>Binary</span>
+          <button class="path-btn" id="btnClaudeBin">PATH</button>
+        </label>
+        <label class="field row">
+          <span>Model</span>
+          <input type="text" id="claudeModel" placeholder="default (leave blank)" />
+        </label>
+        <label class="field row">
+          <span>Effort</span>
+          <select id="claudeEffort">
+            <option value="">default</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="xhigh">xhigh</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+        <label class="field row">
+          <span>Permission mode</span>
+          <select id="claudePermission">
+            <option value="default">ask (default)</option>
+            <option value="acceptEdits">acceptEdits</option>
+            <option value="plan">plan</option>
+            <option value="auto">auto</option>
+            <option value="bypassPermissions">bypassPermissions</option>
+          </select>
+        </label>
+        <p class="hint">
+          Claude Code runs with its own tools and permissions. In <code>-p</code> mode nobody can answer a
+          permission prompt from inside the deck, so pick a mode that does not need one.
+        </p>
+
+        <h3>GitHub Copilot CLI</h3>
+        <label class="field row">
+          <span>Binary</span>
+          <button class="path-btn" id="btnCopilotBin">PATH</button>
+        </label>
+        <label class="field row">
+          <span>Model</span>
+          <input type="text" id="copilotModel" placeholder="default (leave blank)" />
+        </label>
+        <label class="field row checkbox">
+          <input type="checkbox" id="copilotAllowAll" />
+          <span>Pass <code>--allow-all-tools</code></span>
+        </label>
+        <label class="field row">
+          <span>Denied tools</span>
+          <input type="text" id="copilotDeny" placeholder="shell(rm), shell(del)" />
+        </label>
+        <p class="hint">
+          Deny rules outrank <code>--allow-all-tools</code>, so the list above still applies when the box is ticked.
+        </p>
+
+        <h3>Sampling (local models)</h3>
+        <div class="field-grid">
+          <label class="field"><span>temperature</span><input type="number" id="sampTemp" step="0.05" min="0" max="2" /></label>
+          <label class="field"><span>top_p</span><input type="number" id="sampTopP" step="0.01" min="0" max="1" /></label>
+          <label class="field"><span>max tokens</span><input type="number" id="sampMax" step="128" min="64" max="131072" /></label>
+        </div>
+
+        <h3>Config file</h3>
+        <button class="ghost-btn" id="btnRevealConfig">Show config.json in Explorer</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ──────────────────────── model scan dialog ──────────────────────── -->
+  <div id="scanModal" class="modal" hidden>
+    <div class="modal-card">
+      <header class="modal-head">
+        <h2>Models found</h2>
+        <button class="icon-btn" id="btnCloseScan">×</button>
+      </header>
+      <div class="modal-body">
+        <p class="hint" id="scanDir"></p>
+        <ul class="scan-list" id="scanList"></ul>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

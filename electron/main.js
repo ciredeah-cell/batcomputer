@@ -1,0 +1,610 @@
+'use strict';
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu, Tray, nativeImage } = require('electron');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const { Config } = require('./lib/config');
+const hardware = require('./lib/hardware');
+const gguf = require('./lib/gguf');
+const planner = require('./lib/planner');
+const { LlamaServer, findLlamaServer } = require('./lib/llama');
+const tools = require('./lib/tools');
+const { LocalAgent } = require('./lib/agent');
+const cli = require('./lib/cli-agent');
+
+const isDev = process.argv.includes('--dev');
+
+let win = null;
+let tray = null;
+let config = null;
+let hw = null;
+let llama = null;
+let agent = null;
+let toolCtx = null;
+const cliSessions = new Map();          // 'claude' | 'copilot' -> session
+const pendingApprovals = new Map();     // id -> resolve
+
+/* ------------------------------- plumbing -------------------------------- */
+
+function emit(event) {
+  if (win && !win.isDestroyed()) win.webContents.send('deck:event', event);
+}
+
+function buildToolCtx() {
+  const cfg = config.get();
+  toolCtx = new tools.ToolContext({
+    workspace: cfg.workspace || app.getPath('documents'),
+    shell: cfg.shell,
+    approvalMode: cfg.approvalMode,
+    onEvent: emit,
+  });
+  return toolCtx;
+}
+
+function requestApproval(req) {
+  return new Promise((resolve) => {
+    pendingApprovals.set(req.id, resolve);
+    emit({ type: 'approval:request', ...req });
+    // No timeout: a tool call waits as long as the user needs. The UI exposes
+    // Deny and Cancel, and aborting the turn rejects everything outstanding.
+  });
+}
+
+function resolveApproval(id, decision) {
+  const resolve = pendingApprovals.get(id);
+  if (!resolve) return { ok: false, error: 'no pending approval with that id' };
+  pendingApprovals.delete(id);
+  resolve(decision);
+  return { ok: true };
+}
+
+function clearApprovals(decision = 'abort') {
+  for (const [id, resolve] of pendingApprovals) { resolve(decision); pendingApprovals.delete(id); }
+}
+
+/* ------------------------------ model library ----------------------------- */
+
+const SHARD_RE = /-\d{5}-of-\d{5}\.gguf$/i;
+
+function scanModels(dir, depth = 3) {
+  const found = [];
+  const walk = (d, level) => {
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch (_) { return; }
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) {
+        if (level < depth && !e.name.startsWith('.')) walk(p, level + 1);
+      } else if (/\.gguf$/i.test(e.name)) {
+        // Multi-part models are referenced by their first shard; llama.cpp
+        // finds the rest. mmproj files are vision projectors, not models.
+        if (SHARD_RE.test(e.name) && !/-00001-of-/i.test(e.name)) continue;
+        if (/^mmproj|mmproj.*\.gguf$/i.test(e.name)) continue;
+        found.push(p);
+      }
+    }
+  };
+  walk(dir, 0);
+  return found;
+}
+
+function describeModel(modelPath) {
+  const meta = gguf.readGGUF(modelPath);
+  if (!meta.ok) return { ok: false, modelPath, error: meta.error };
+  return { ok: true, modelPath, summary: meta.summary, tensorTypes: meta.tensorTypes, version: meta.version };
+}
+
+function registerModel(modelPath, { isPrimary = false } = {}) {
+  const described = describeModel(modelPath);
+  if (!described.ok) return described;
+  const cfg = config.get();
+  const existing = cfg.models.find((m) => m.modelPath === modelPath);
+  const id = existing ? existing.id : crypto.randomUUID();
+  const profile = existing && existing.profile
+    ? { ...planner.defaultProfile(modelPath, described.summary, hw), ...existing.profile, modelPath }
+    : planner.defaultProfile(modelPath, described.summary, hw);
+  profile.backend = cfg.llamaBackend || profile.backend;
+  const model = {
+    id,
+    name: existing ? existing.name : described.summary.name,
+    modelPath,
+    meta: described.summary,
+    tensorTypes: described.tensorTypes,
+    profile,
+    isPrimary: existing ? existing.isPrimary : isPrimary,
+    addedAt: existing ? existing.addedAt : new Date().toISOString(),
+  };
+  config.upsertModel(model);
+  return { ok: true, model };
+}
+
+function planFor(modelId, overrides) {
+  const model = config.model(modelId);
+  if (!model) return { ok: false, error: 'unknown model' };
+  const cfg = config.get();
+  const profile = { ...model.profile, ...(overrides || {}) };
+  const result = planner.plan({
+    summary: model.meta,
+    profile,
+    hw,
+    budgetGB: cfg.gpuBudgetGB || hw.suggestedGpuBudgetGB,
+  });
+  return {
+    ok: true,
+    modelId,
+    profile,
+    plan: result,
+    commandPreview: [cfg.llamaServerPath || 'llama-server', ...planner.buildArgs(profile)].join(' '),
+    env: planner.buildEnv({ ...profile, backend: cfg.llamaBackend }),
+  };
+}
+
+/* --------------------------------- window -------------------------------- */
+
+function createWindow() {
+  win = new BrowserWindow({
+    width: 1380,
+    height: 900,
+    minWidth: 980,
+    minHeight: 640,
+    backgroundColor: '#0e1116',
+    title: 'Laguna Deck',
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      spellcheck: false,
+    },
+  });
+  win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+  if (isDev) win.webContents.openDevTools({ mode: 'detach' });
+
+  // Links open in the user's browser, never inside the app shell.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  win.on('closed', () => { win = null; });
+}
+
+/**
+ * Headless boot check (LAGUNA_SMOKE=1, or `npm run smoke`): load the real
+ * window, then assert the renderer actually bootstrapped instead of dying on an
+ * exception nobody sees. Catches the whole main-to-renderer path -- preload
+ * bridge, IPC, first render -- which the node-only self-test cannot reach.
+ */
+async function runSmoke() {
+  const wc = win.webContents;
+  const errors = [];
+  wc.on('console-message', (_e, level, message) => {
+    if (level >= 2) errors.push(message);
+  });
+  wc.on('render-process-gone', (_e, details) => errors.push('renderer gone: ' + JSON.stringify(details)));
+  await new Promise((resolve) => wc.once('did-finish-load', resolve));
+  await new Promise((r) => setTimeout(r, 2500)); // let bootstrap() settle
+
+  const probe = await wc.executeJavaScript(`(() => ({
+    bridge: typeof window.deck === 'object' && typeof window.deck.bootstrap === 'function',
+    gotConfig: !!(window.__deckState && window.__deckState.config),
+    hwLine: document.querySelector('#hwLine').textContent,
+    modelRows: document.querySelectorAll('#modelList li').length,
+    cliRows: document.querySelectorAll('#cliList .driver').length,
+    claudeMeta: document.querySelector('#metaClaude').textContent,
+    activeName: document.querySelector('#activeName').textContent,
+    budget: document.querySelector('#budgetNums').textContent,
+    sendDisabled: document.querySelector('#btnSend').disabled,
+    tabs: document.querySelectorAll('.deck-tabs .tab').length,
+  }))()`).catch((err) => ({ error: err.message }));
+
+  // Second phase: put a real (fixture) model through the library, then select
+  // it, so the budget meter, the advice list and the offload form all render
+  // for real. Those are the renderer's most involved paths.
+  const { buildFixtureGGUF } = require('./lib/fixture-gguf');
+  const fixture = path.join(app.getPath('temp'), 'laguna-deck-smoke.gguf');
+  buildFixtureGGUF(fixture, { name: 'Smoke XS' });
+  const added = await wc.executeJavaScript(
+    'window.deck.models.add({ modelPath: ' + JSON.stringify(fixture) + ' })');
+  await wc.executeJavaScript('location.reload()').catch(() => {});
+  await new Promise((resolve) => wc.once('did-finish-load', resolve));
+  await new Promise((r) => setTimeout(r, 2500));
+  const deep = await wc.executeJavaScript(`(async () => {
+    const row = document.querySelector('#modelList li.driver');
+    if (row) row.click();
+    await new Promise((r) => setTimeout(r, 900));
+    document.querySelector('.deck-tabs .tab[data-tab="profile"]').click();
+    await new Promise((r) => setTimeout(r, 400));
+    return {
+      rowRendered: !!row,
+      rowText: row ? row.textContent : '',
+      budget: document.querySelector('#budgetNums').textContent,
+      statRows: document.querySelectorAll('#statGrid dt').length,
+      advice: document.querySelectorAll('#adviceList .advice').length,
+      profileFields: document.querySelectorAll('#profileForm .field').length,
+      cmdline: (document.querySelector('#profileForm .cmdline') || {}).textContent || '',
+      activeName: document.querySelector('#activeName').textContent,
+      sendDisabled: document.querySelector('#btnSend').disabled,
+    };
+  })()`).catch((err) => ({ error: err.message }));
+
+  const checks = [
+    ['preload bridge present', probe.bridge === true],
+    ['bootstrap returned config', probe.gotConfig === true],
+    ['hardware line rendered', !!probe.hwLine && probe.hwLine !== 'probing hardware…'],
+    ['both CLI driver rows rendered', probe.cliRows === 2],
+    ['CLI detection ran', probe.claudeMeta !== 'checking…'],
+    ['deck tabs rendered', probe.tabs === 3],
+    ['no driver selected on a clean profile', probe.sendDisabled === true],
+    ['added model appears in the rail', deep.rowRendered === true],
+    ['model row shows its MoE routing', /MoE 8\/64/.test(deep.rowText || '')],
+    ['budget meter has numbers', /GiB \/ /.test(deep.budget || '')],
+    ['budget stats rendered', (deep.statRows || 0) >= 6],
+    ['offload form rendered', (deep.profileFields || 0) >= 12],
+    ['command preview includes the model', /--jinja/.test(deep.cmdline || '')],
+    ['selecting a model enables the composer', deep.sendDisabled === false],
+    ['no renderer errors', errors.length === 0],
+  ];
+  const failed = checks.filter(([, ok]) => !ok);
+  for (const [name, ok] of checks) console.log((ok ? '  ok   ' : '  FAIL ') + name);
+  if (probe.error) console.log('  probe error: ' + probe.error);
+  if (deep.error) console.log('  deep-probe error: ' + deep.error);
+  if (added && added.ok === false) console.log('  model add failed: ' + added.error);
+  try { fs.unlinkSync(fixture); } catch (_) { /* best effort */ }
+
+  // LAGUNA_SMOKE_SHOT=<path> saves a PNG of the loaded window, for eyeballing
+  // the layout on a machine with no display.
+  if (process.env.LAGUNA_SMOKE_SHOT) {
+    try {
+      const shot = async (suffix) => {
+        const img = await wc.capturePage();
+        const file = process.env.LAGUNA_SMOKE_SHOT.replace(/\.png$/, '') + suffix + '.png';
+        fs.writeFileSync(file, img.toPNG());
+        console.log('  screenshot: ' + file);
+      };
+      await shot('-offload');
+      await wc.executeJavaScript('document.querySelector(\'.deck-tabs .tab[data-tab="budget"]\').click()');
+      await new Promise((r) => setTimeout(r, 500));
+      await shot('-budget');
+    } catch (err) { console.log('  screenshot failed: ' + err.message); }
+  }
+  for (const e of errors) console.log('  console: ' + e);
+  console.log(failed.length ? '\nsmoke FAILED (' + failed.length + ')\n' : '\nsmoke passed\n');
+  app.exit(failed.length ? 1 : 0);
+}
+
+function createTray() {
+  try {
+    const img = nativeImage.createFromDataURL(TRAY_ICON);
+    tray = new Tray(img);
+    tray.setToolTip('Laguna Deck');
+    const refresh = () => {
+      const st = llama ? llama.status() : { state: 'stopped' };
+      tray.setContextMenu(Menu.buildFromTemplate([
+        { label: 'Laguna Deck', enabled: false },
+        { label: 'Model: ' + st.state + (st.modelId ? '' : ' (none loaded)'), enabled: false },
+        { type: 'separator' },
+        { label: 'Show window', click: () => { if (!win) createWindow(); else win.show(); } },
+        { label: 'Unload model', enabled: st.state === 'ready', click: () => llama.stop() },
+        { type: 'separator' },
+        { label: 'Quit', click: () => { app.quit(); } },
+      ]));
+    };
+    refresh();
+    setInterval(refresh, 4000);
+  } catch (_) { /* a tray is a nicety, not a requirement */ }
+}
+
+// A 16x16 teal square: enough to be findable in the tray without shipping a binary asset.
+const TRAY_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAPElEQVR42mNkIAIwDg0wGBkZGf4zMDAwMDAwMPxnYGBgYGBgYPjPwMDAwMDAwPCfgYGBgYGBgeE/AwMDAwMDAwBvRwgBkmQ1cQAAAABJRU5ErkJggg==';
+
+/* ---------------------------------- IPC ---------------------------------- */
+
+function wireIpc() {
+  const handle = (channel, fn) => ipcMain.handle(channel, async (_evt, payload) => {
+    try { return await fn(payload || {}); } catch (err) {
+      return { ok: false, error: err.message, stack: isDev ? err.stack : undefined };
+    }
+  });
+
+  handle('app:bootstrap', async () => {
+    const cfg = config.get();
+    if (!cfg.llamaServerPath) {
+      const found = findLlamaServer(null);
+      if (found) config.patch({ llamaServerPath: found });
+    }
+    if (!cfg.workspace) config.patch({ workspace: app.getPath('documents') });
+    buildToolCtx();
+    return {
+      ok: true,
+      config: config.get(),
+      hw,
+      llama: llama.status(),
+      cli: await cli.detect(config.get().cli),
+      platform: process.platform,
+      appVersion: app.getVersion(),
+      tools: Object.entries(tools.TOOLS).map(([name, t]) => ({ name, risk: t.risk, description: t.description })),
+    };
+  });
+
+  handle('config:patch', async ({ patch }) => {
+    const data = config.patch(patch || {});
+    buildToolCtx();
+    return { ok: true, config: data };
+  });
+
+  handle('config:reveal', async () => {
+    shell.showItemInFolder(config.file);
+    return { ok: true };
+  });
+
+  handle('fs:pickDirectory', async ({ title }) => {
+    const r = await dialog.showOpenDialog(win, { title: title || 'Choose a folder', properties: ['openDirectory', 'createDirectory'] });
+    return { ok: !r.canceled, path: r.canceled ? null : r.filePaths[0] };
+  });
+
+  handle('fs:pickFile', async ({ title, filters }) => {
+    const r = await dialog.showOpenDialog(win, { title: title || 'Choose a file', properties: ['openFile'], filters });
+    return { ok: !r.canceled, path: r.canceled ? null : r.filePaths[0] };
+  });
+
+  handle('hw:refresh', async () => {
+    hw = await hardware.probe();
+    return { ok: true, hw };
+  });
+
+  handle('models:scan', async ({ dir }) => {
+    const target = dir || config.get().modelsDir;
+    if (!target) return { ok: false, error: 'no models folder set' };
+    const paths = scanModels(target);
+    const results = paths.map((p) => {
+      const d = describeModel(p);
+      return d.ok
+        ? { modelPath: p, name: d.summary.name, sizeBytes: d.summary.sizeBytes, meta: d.summary }
+        : { modelPath: p, error: d.error };
+    });
+    config.patch({ modelsDir: target });
+    return { ok: true, dir: target, found: results };
+  });
+
+  handle('models:add', async ({ modelPath, isPrimary }) => {
+    const r = registerModel(modelPath, { isPrimary });
+    return r.ok ? { ok: true, config: config.get(), model: r.model } : r;
+  });
+
+  handle('models:remove', async ({ id }) => {
+    if (llama.modelId === id && llama.state !== 'stopped') await llama.stop();
+    return { ok: true, config: config.removeModel(id) };
+  });
+
+  handle('models:update', async ({ id, patch }) => {
+    const model = config.model(id);
+    if (!model) return { ok: false, error: 'unknown model' };
+    const next = { ...model, ...patch, profile: { ...model.profile, ...(patch.profile || {}) } };
+    config.upsertModel(next);
+    return { ok: true, config: config.get(), model: next };
+  });
+
+  handle('models:plan', async ({ id, overrides }) => planFor(id, overrides));
+
+  handle('models:inspect', async ({ modelPath }) => {
+    const meta = gguf.readGGUF(modelPath);
+    if (!meta.ok) return meta;
+    // The full kv map includes the tokenizer; strip the elided arrays for the UI.
+    const kv = {};
+    for (const [k, v] of Object.entries(meta.kv)) {
+      if (v && typeof v === 'object' && v.__elided) kv[k] = '[' + v.count + ' values]';
+      else kv[k] = v;
+    }
+    return { ok: true, summary: meta.summary, kv, tensorTypes: meta.tensorTypes, version: meta.version };
+  });
+
+  handle('llama:start', async ({ id, overrides }) => {
+    const cfg = config.get();
+    const model = config.model(id);
+    if (!model) return { ok: false, error: 'unknown model' };
+    const profile = { ...model.profile, ...(overrides || {}) };
+    const binPath = findLlamaServer(cfg.llamaServerPath);
+    const res = await llama.start({ binPath, profile, modelId: id, backend: cfg.llamaBackend });
+    config.patch({ activeModelId: id });
+    if (overrides) config.upsertModel({ ...model, profile });
+    return { ok: true, ...res, status: llama.status() };
+  });
+
+  handle('llama:stop', async () => {
+    await llama.stop();
+    return { ok: true, status: llama.status() };
+  });
+
+  handle('llama:status', async () => ({ ok: true, status: llama.status() }));
+
+  handle('llama:swap', async ({ id, overrides }) => {
+    // One model at a time: on a unified-memory box the second one would evict
+    // the first anyway, so make the stop explicit and visible.
+    const cfg = config.get();
+    const model = config.model(id);
+    if (!model) return { ok: false, error: 'unknown model' };
+    await llama.stop();
+    const profile = { ...model.profile, ...(overrides || {}) };
+    const res = await llama.start({
+      binPath: findLlamaServer(cfg.llamaServerPath),
+      profile,
+      modelId: id,
+      backend: cfg.llamaBackend,
+    });
+    config.patch({ activeModelId: id });
+    if (overrides) config.upsertModel({ ...model, profile });
+    return { ok: true, ...res, status: llama.status() };
+  });
+
+  /* ----- local agent ----- */
+
+  handle('agent:send', async ({ text, enabledTools }) => {
+    const cfg = config.get();
+    const model = cfg.activeModelId ? config.model(cfg.activeModelId) : null;
+    buildToolCtx();
+    const res = await agent.send({
+      text,
+      toolCtx,
+      modelName: model ? model.name : null,
+      sampling: cfg.sampling,
+      approvalMode: cfg.approvalMode,
+      enabledTools: enabledTools && enabledTools.length ? enabledTools : undefined,
+    });
+    return { ok: true, ...res };
+  });
+
+  handle('agent:abort', async () => {
+    clearApprovals('abort');
+    agent.abort();
+    return { ok: true };
+  });
+
+  handle('agent:reset', async () => { agent.reset(); return { ok: true }; });
+  handle('agent:transcript', async () => ({ ok: true, messages: agent.transcript() }));
+  handle('agent:approve', async ({ id, decision }) => resolveApproval(id, decision));
+
+  /* ----- CLI drivers ----- */
+
+  handle('cli:detect', async () => ({ ok: true, cli: await cli.detect(config.get().cli) }));
+
+  handle('cli:start', async ({ agent: which, cwd, resume }) => {
+    const cfg = config.get();
+    const detected = await cli.detect(cfg.cli);
+    const info = detected[which];
+    if (!info || !info.installed) {
+      return {
+        ok: false,
+        error: which === 'claude'
+          ? 'Claude Code is not on PATH. Install it, then point Settings at the binary.'
+          : 'GitHub Copilot CLI is not on PATH. Install it, then point Settings at the binary.',
+      };
+    }
+    const workDir = cwd || cfg.workspace;
+    if (!workDir || !fs.existsSync(workDir)) return { ok: false, error: 'working directory does not exist: ' + workDir };
+
+    const existing = cliSessions.get(which);
+    if (existing) await existing.stop();
+
+    let session;
+    if (which === 'claude') {
+      session = new cli.ClaudeSession({
+        bin: info.bin,
+        cwd: workDir,
+        onEvent: emit,
+        model: cfg.cli.claude.model,
+        effort: cfg.cli.claude.effort,
+        permissionMode: cfg.cli.claude.permissionMode,
+        extraArgs: cfg.cli.claude.extraArgs,
+        resume: resume || null,
+      });
+    } else {
+      session = new cli.CopilotSession({
+        bin: info.bin,
+        cwd: workDir,
+        onEvent: emit,
+        model: cfg.cli.copilot.model,
+        allowAllTools: cfg.cli.copilot.allowAllTools,
+        allowTools: cfg.cli.copilot.allowTools,
+        denyTools: cfg.cli.copilot.denyTools,
+        extraArgs: cfg.cli.copilot.extraArgs,
+        addDirs: [],
+      });
+    }
+    cliSessions.set(which, session);
+    const started = await session.start();
+    return { ok: true, started, status: session.status() };
+  });
+
+  handle('cli:send', async ({ agent: which, text }) => {
+    const session = cliSessions.get(which);
+    if (!session) return { ok: false, error: 'no ' + which + ' session is running; launch it first' };
+    return { ok: true, ...session.send(text) };
+  });
+
+  handle('cli:interrupt', async ({ agent: which }) => {
+    const session = cliSessions.get(which);
+    if (!session) return { ok: false, error: 'no session' };
+    return { ok: true, ...session.interrupt() };
+  });
+
+  handle('cli:stop', async ({ agent: which }) => {
+    const session = cliSessions.get(which);
+    if (!session) return { ok: true };
+    await session.stop();
+    cliSessions.delete(which);
+    return { ok: true };
+  });
+
+  handle('cli:status', async () => {
+    const out = {};
+    for (const [k, s] of cliSessions) out[k] = s.status();
+    return { ok: true, sessions: out };
+  });
+
+  handle('cli:openTerminal', async ({ agent: which, cwd, resumeId }) => {
+    const cfg = config.get();
+    const detected = await cli.detect(cfg.cli);
+    const info = detected[which];
+    if (!info || !info.installed) return { ok: false, error: which + ' is not installed' };
+    return cli.openInTerminal({ agent: which, bin: info.bin, cwd: cwd || cfg.workspace, resumeId });
+  });
+
+  handle('shell:openPath', async ({ target }) => {
+    const err = await shell.openPath(target);
+    return err ? { ok: false, error: err } : { ok: true };
+  });
+
+  handle('shell:openExternal', async ({ url }) => {
+    if (!/^https?:\/\//.test(url)) return { ok: false, error: 'only http(s) links are opened' };
+    await shell.openExternal(url);
+    return { ok: true };
+  });
+}
+
+/* --------------------------------- boot ---------------------------------- */
+
+const singleInstance = app.requestSingleInstanceLock();
+if (!singleInstance) {
+  app.quit();
+} else {
+  app.on('second-instance', () => { if (win) { win.show(); win.focus(); } });
+
+  app.whenReady().then(async () => {
+    config = new Config(app.getPath('userData'));
+    hw = await hardware.probe();
+    llama = new LlamaServer({ onEvent: emit });
+    agent = new LocalAgent({
+      getStatus: () => llama.status(),
+      onEvent: emit,
+      requestApproval,
+      getConfig: () => {
+        const cfg = config.get();
+        const model = cfg.activeModelId ? config.model(cfg.activeModelId) : null;
+        return { ctx: model && model.profile ? model.profile.ctx : 8192, sampling: cfg.sampling };
+      },
+    });
+    buildToolCtx();
+    wireIpc();
+    createWindow();
+    if (process.env.LAGUNA_SMOKE === '1') { await runSmoke(); return; }
+    createTray();
+  });
+
+  app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+  app.on('activate', () => { if (!win) createWindow(); });
+
+  // Never leave a llama-server or a CLI agent running after the window closes:
+  // on a unified-memory box an orphan holds tens of gigabytes.
+  app.on('before-quit', async (e) => {
+    if (app.__cleaning) return;
+    app.__cleaning = true;
+    e.preventDefault();
+    clearApprovals('abort');
+    try { agent.abort(); } catch (_) { /* nothing running */ }
+    for (const [, s] of cliSessions) { try { await s.stop(); } catch (_) { /* already gone */ } }
+    try { await llama.stop(); } catch (_) { /* already gone */ }
+    app.exit(0);
+  });
+}

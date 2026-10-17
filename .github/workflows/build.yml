@@ -1,0 +1,67 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # The self-test is platform-independent: GGUF parsing, offload maths, the
+    # tool sandbox, the agent loop against a mock server, CLI event parsing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+      - run: npm run selftest
+      # The smoke check boots the real window headlessly and asserts the
+      # renderer bootstrapped -- it has already caught a CSP violation and an
+      # un-rendered topbar that the node-only tests could not see.
+      - run: sudo apt-get update && sudo apt-get install -y xvfb
+      - run: xvfb-run -a npm run smoke
+
+  windows:
+    # The installer has to be built on Windows; this is the artifact the friend
+    # downloads, so it is produced here rather than cross-compiled.
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install --no-audit --no-fund
+      - run: npm run selftest
+      - run: npm run dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: laguna-deck-windows
+          path: |
+            dist/*.exe
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    # Tag a commit (git tag v0.1.0 && git push --tags) and the installer is
+    # attached to a GitHub release, so grabbing it is one click.
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: laguna-deck-windows
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
