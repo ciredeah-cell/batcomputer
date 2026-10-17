@@ -35,7 +35,7 @@ from the tagged commit.
 **From source** (Node 20+):
 
 ```powershell
-git clone https://github.com/<owner>/batcomputer.git
+git clone https://github.com/ciredeah-cell/batcomputer.git
 cd batcomputer
 npm install
 npm start
