@@ -28,7 +28,7 @@ Point it at whatever GGUF you drive with day to day; everything else works the s
 ## Install
 
 **The easy way.** Grab the installer from
-[Releases](../../releases) — `Batcomputer-Setup-x.y.z.exe` — or the portable
+[Releases](../../releases) — `Batcomputer.Setup.<version>.exe` — or the portable
 `.zip` if you'd rather not install anything. Both are built on Windows by CI
 from the tagged commit.
 
