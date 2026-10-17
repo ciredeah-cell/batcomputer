@@ -421,6 +421,17 @@ async function main() {
     assert.ok(events.some((e) => e.type === 'cli:delta' && /plain progress/.test(e.text)));
   });
 
+  await test('windows argv quoting survives prompts with spaces and quotes', () => {
+    const q = cli.quoteWinArg;
+    assert.strictEqual(q('simple'), 'simple');
+    assert.strictEqual(q('fix the retry bug'), '"fix the retry bug"');
+    assert.strictEqual(q('say "hi"'), '"say \\"hi\\""');
+    assert.match(q('C:\\Program Files\\copilot.cmd'), /^"C:\\Program Files\\copilot\.cmd"$/);
+    // An unquoted multi-word prompt is the bug this prevents: the CLI would
+    // receive four arguments and act on the first word.
+    assert.notStrictEqual(q('fix the retry bug'), 'fix the retry bug');
+  });
+
   console.log('\nsessions');
   await test('a session records a transcript and names itself from the first turn', () => {
     const store = new SessionStore(path.join(tmp, 'store'));

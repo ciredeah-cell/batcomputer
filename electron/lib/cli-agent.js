@@ -80,6 +80,33 @@ async function detect(cfg = {}) {
   return out;
 }
 
+/**
+ * Spawn a CLI that may be an npm shim.
+ *
+ * On Windows `claude` and `copilot` are usually `.cmd` files, which cmd.exe has
+ * to run. Node's `shell: true` would do that but joins argv with spaces and
+ * escapes nothing -- so `-p "fix the retry bug"` arrives as four arguments and
+ * the agent is asked to "fix". Quoting the command line ourselves and passing
+ * it verbatim is the documented way to get this right.
+ */
+function spawnCli(bin, args, opts = {}) {
+  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin)) {
+    const line = [bin, ...args].map(quoteWinArg).join(' ');
+    return spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', line], {
+      ...opts,
+      windowsVerbatimArguments: true,
+    });
+  }
+  return spawn(bin, args, opts);
+}
+
+/** Quote one argument for cmd.exe: wrap in quotes, escape embedded quotes. */
+function quoteWinArg(arg) {
+  const s = String(arg);
+  if (s !== '' && !/[\s"^&|<>()%!]/.test(s)) return s;
+  return '"' + s.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1') + '"';
+}
+
 /* ------------------------------ Claude Code ------------------------------ */
 
 class ClaudeSession {
@@ -123,12 +150,11 @@ class ClaudeSession {
     if (this.proc) return { ok: true, pid: this.proc.pid };
     const args = this.args();
     this.commandLine = [this.bin, ...args].join(' ');
-    this.proc = spawn(this.bin, args, {
+    this.proc = spawnCli(this.bin, args, {
       cwd: this.cwd,
       windowsHide: true,
       env: process.env,
       stdio: ['pipe', 'pipe', 'pipe'],
-      shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(this.bin),
     });
     this.alive = true;
     this.proc.stdout.setEncoding('utf8');
@@ -336,12 +362,11 @@ class CopilotSession {
     this.buf = '';
     this.onEvent({ type: 'cli:sent', agent: 'copilot', text, commandLine: this.commandLine });
 
-    this.proc = spawn(this.bin, args, {
+    this.proc = spawnCli(this.bin, args, {
       cwd: this.cwd,
       windowsHide: true,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(this.bin),
     });
     this.proc.stdout.setEncoding('utf8');
     this.proc.stdout.on('data', (chunk) => this.ingest(chunk));
@@ -453,4 +478,4 @@ function openInTerminal({ agent, bin, cwd, resumeId }) {
   return { ok: false, error: 'no terminal emulator found' };
 }
 
-module.exports = { detect, which, ClaudeSession, CopilotSession, openInTerminal };
+module.exports = { detect, which, ClaudeSession, CopilotSession, openInTerminal, quoteWinArg };
