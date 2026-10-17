@@ -1,7 +1,7 @@
 {
   "name": "batcomputer",
   "productName": "Batcomputer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A local-AI console for Windows: agentic chat over llama.cpp with offload planning for unified-memory boxes, plus Claude Code, GitHub Copilot and ComfyUI as drop-in drivers.",
   "main": "electron/main.js",
   "license": "MIT",
