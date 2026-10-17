@@ -23,6 +23,7 @@ const cli = require('./lib/cli-agent');
 const { buildFixtureGGUF: buildGGUF } = require('./lib/fixture-gguf');
 const { SessionStore } = require('./lib/sessions');
 const comfy = require('./lib/comfy');
+const monitor = require('./lib/monitor');
 
 let passed = 0;
 const failures = [];
@@ -466,6 +467,15 @@ async function main() {
     store.remove(s.id);
     assert.strictEqual(store.list().length, 0);
     assert.strictEqual(store.load(s.id), null);
+  });
+
+  console.log('\nmonitor');
+  await test('process memory sampling is batched and tolerates dead pids', async () => {
+    const r = await monitor.processRssMany([process.pid, 999999]);
+    assert.ok(r[process.pid] > 1024 * 1024, 'should measure this process');
+    assert.strictEqual(r[999999], undefined, 'a dead pid is omitted, not zero or null');
+    const empty = await monitor.processRssMany([]);
+    assert.deepStrictEqual(empty, {}, 'no pids means no subprocess at all');
   });
 
   console.log('\ncomfyui');

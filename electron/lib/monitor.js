@@ -19,22 +19,48 @@ function run(cmd, args, timeout = 6000) {
   });
 }
 
-/** Resident set size of one process, in bytes. Null if it is gone. */
-async function processRss(pid) {
-  if (!pid) return null;
+/**
+ * Resident set size for several processes at once, as { pid: bytes }.
+ *
+ * Batched deliberately: PowerShell costs a few hundred milliseconds to start,
+ * and launching one per process per tick -- every two seconds, forever -- is a
+ * measurable tax on the machine you are trying to measure.
+ */
+async function processRssMany(pids) {
+  const out = {};
+  const list = pids.filter(Boolean);
+  if (!list.length) return out;
+
   if (process.platform === 'win32') {
-    const out = await run('powershell.exe', [
+    const text = await run('powershell.exe', [
       '-NoProfile', '-NonInteractive', '-Command',
-      '(Get-Process -Id ' + pid + ' -ErrorAction SilentlyContinue).WorkingSet64',
+      'Get-Process -Id ' + list.join(',') + ' -ErrorAction SilentlyContinue |'
+      + ' Select-Object Id,WorkingSet64 | ConvertTo-Json -Compress',
     ]);
-    const n = out ? parseInt(out.trim(), 10) : NaN;
-    return Number.isFinite(n) ? n : null;
+    if (!text) return out;
+    try {
+      const parsed = JSON.parse(text);
+      for (const row of Array.isArray(parsed) ? parsed : [parsed]) {
+        if (row && Number.isFinite(row.WorkingSet64)) out[row.Id] = row.WorkingSet64;
+      }
+    } catch (_) { /* a dead process mid-sample is normal */ }
+    return out;
   }
-  try {
-    const status = fs.readFileSync('/proc/' + pid + '/status', 'utf8');
-    const m = /VmRSS:\s+(\d+) kB/.exec(status);
-    return m ? parseInt(m[1], 10) * 1024 : null;
-  } catch (_) { return null; }
+
+  for (const pid of list) {
+    try {
+      const status = fs.readFileSync('/proc/' + pid + '/status', 'utf8');
+      const m = /VmRSS:\s+(\d+) kB/.exec(status);
+      if (m) out[pid] = parseInt(m[1], 10) * 1024;
+    } catch (_) { /* gone */ }
+  }
+  return out;
+}
+
+/** Convenience wrapper for a single process. */
+async function processRss(pid) {
+  const m = await processRssMany([pid]);
+  return m[pid] === undefined ? null : m[pid];
 }
 
 /**
@@ -95,11 +121,10 @@ class Monitor {
     const total = os.totalmem();
     const free = os.freemem();
     const pids = this.getPids() || {};
+    const rssByPid = await processRssMany(Object.values(pids));
     const procs = {};
     for (const [name, pid] of Object.entries(pids)) {
-      if (!pid) continue;
-      const rss = await processRss(pid);
-      if (rss) procs[name] = { pid, rssBytes: rss };
+      if (pid && rssByPid[pid]) procs[name] = { pid, rssBytes: rssByPid[pid] };
     }
 
     // GPU tools are slow to shell out to; poll them a tenth as often.
@@ -131,4 +156,4 @@ function sumProcs(procs) {
   return Object.values(procs).reduce((n, p) => n + (p.rssBytes || 0), 0);
 }
 
-module.exports = { Monitor, processRss, gpuMemory, GB };
+module.exports = { Monitor, processRss, processRssMany, gpuMemory, GB };
