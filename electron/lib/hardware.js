@@ -9,10 +9,13 @@ const { execFile } = require('child_process');
 
 const GB = 1024 ** 3;
 
-function run(cmd, args, timeout = 8000) {
+function run(cmd, args, timeout = 15000) {
   return new Promise((resolve) => {
     execFile(cmd, args, { timeout, windowsHide: true, maxBuffer: 4 << 20 }, (err, stdout) => {
-      resolve(err ? null : String(stdout));
+      // A non-zero exit with usable output still counts: a WMI class we cannot
+      // read should cost us that one field, not the whole hardware probe.
+      const text = String(stdout || '');
+      resolve(err && !text.trim() ? null : text);
     });
   });
 }
@@ -105,13 +108,26 @@ function estimateBandwidth(hw) {
   };
 }
 
+// Integrated graphics share system memory; a discrete card does not. Model
+// names overlap enough (an "Arc Pro B70" board and an "Arc Graphics" iGPU) that
+// a single keyword test gets it wrong, so look for a discrete marker first.
+const DISCRETE = /\b(rtx|gtx|geforce|quadro|tesla|radeon\s+rx|\brx\s*\d{3,4}\b|arc\s*(pro\s*)?[ab]\d{3}|a7\d0|b5\d0|b7\d0)\b/i;
+const INTEGRATED = /radeon\(tm\)?\s+graphics|radeon\s+\d{3}m|\biris\b|uhd\s+graphics|hd\s+graphics|\bvega\s*\d|arc\(tm\)?\s*\d+v|arc\s+graphics|apple\s+m\d/i;
+
+function isUnified(gpus) {
+  const names = (gpus || []).map((g) => g.name || '');
+  if (names.some((n) => DISCRETE.test(n))) return false;
+  if (names.some((n) => INTEGRATED.test(n))) return true;
+  // No recognisable GPU: assume shared memory only where that is the norm.
+  return names.length === 0 && process.platform !== 'win32';
+}
+
 async function probe() {
   const hw = (process.platform === 'win32' ? await probeWindows() : null) || await probePosix();
   hw.bandwidth = estimateBandwidth(hw);
   hw.totalRamGB = +(hw.totalRamBytes / GB).toFixed(1);
   hw.freeRamGB = +(hw.freeRamBytes / GB).toFixed(1);
-  hw.unified = hw.gpus.some((g) => /radeon\s*(8\d\d\ds|graphics)|ryzen|arc.*graphics|iris|vega/i.test(g.name || ''))
-    || hw.gpus.length === 0;
+  hw.unified = isUnified(hw.gpus);
   // Default GPU budget: on a unified box the practical ceiling is roughly total
   // RAM minus what Windows and your apps need. 12 GiB of headroom is the floor
   // that keeps the desktop responsive while a model is resident.
@@ -119,4 +135,4 @@ async function probe() {
   return hw;
 }
 
-module.exports = { probe, estimateBandwidth, GB };
+module.exports = { probe, estimateBandwidth, isUnified, GB };

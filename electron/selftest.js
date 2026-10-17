@@ -469,6 +469,21 @@ async function main() {
     assert.strictEqual(store.load(s.id), null);
   });
 
+  console.log('\nhardware');
+  await test('integrated and discrete GPUs are told apart', () => {
+    const { isUnified } = require('./lib/hardware');
+    const u = (name) => isUnified([{ name }]);
+    assert.strictEqual(u('AMD Radeon(TM) Graphics'), true, 'an AMD iGPU shares system memory');
+    assert.strictEqual(u('Radeon 890M Graphics'), true);
+    assert.strictEqual(u('Intel(R) Iris(R) Xe Graphics'), true);
+    assert.strictEqual(u('Intel(R) Arc(TM) 140V GPU'), true);
+    // A discrete board whose name also contains "Arc" and "Graphics".
+    assert.strictEqual(u('Intel(R) Arc(TM) Pro B70 Graphics'), false);
+    assert.strictEqual(u('Intel(R) Arc(TM) A770 Graphics'), false);
+    assert.strictEqual(u('NVIDIA GeForce RTX 4090'), false);
+    assert.strictEqual(u('AMD Radeon RX 7900 XTX'), false);
+  });
+
   console.log('\nmonitor');
   await test('process memory sampling is batched and tolerates dead pids', async () => {
     const r = await monitor.processRssMany([process.pid, 999999]);

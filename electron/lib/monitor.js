@@ -11,10 +11,15 @@ const { execFile } = require('child_process');
 const GB = 1024 ** 3;
 const HISTORY = 90;           // ~3 minutes at the default 2s interval
 
-function run(cmd, args, timeout = 6000) {
+function run(cmd, args, timeout = 10000) {
   return new Promise((resolve) => {
     execFile(cmd, args, { timeout, windowsHide: true, maxBuffer: 2 << 20 }, (err, stdout) => {
-      resolve(err ? null : String(stdout));
+      // Keep the output even on a non-zero exit. PowerShell exits non-zero when
+      // Get-Process is asked about a pid that has already gone -- which happens
+      // routinely here, since we sample processes while they are shutting down
+      // -- but it still prints valid JSON for the ones that are alive.
+      const text = String(stdout || '');
+      resolve(err && !text.trim() ? null : text);
     });
   });
 }
