@@ -469,6 +469,27 @@ async function main() {
     assert.strictEqual(store.load(s.id), null);
   });
 
+  console.log('\nllama supervisor');
+  await test('a dead llama-server gets a diagnosis, not just an exit code', async () => {
+    const { LlamaServer } = require('./lib/llama');
+    const cases = [
+      ['error: invalid argument: --n-cpu-moe', /does not know/],
+      ['ggml_vulkan: Device memory allocation of 9999 MB failed', /allocation failure/],
+      ['llama_model_load: error loading model: no such file', /could not read the model file/],
+      ['error: bind: address already in use', /already on that port/],
+    ];
+    for (const [line, expect] of cases) {
+      const srv = new LlamaServer({ onEvent: () => {} });
+      srv.state = 'starting';
+      srv.log(line);
+      srv.proc = { pid: 1 };
+      // simulate the exit handler's message construction
+      const msg = 'llama-server exited (code 1). Last log: ' + srv.logLines.slice(-3).join(' | ')
+        + require('./lib/llama').__diagnose(srv.logLines);
+      assert.match(msg, expect, 'should explain: ' + line);
+    }
+  });
+
   console.log('\nhardware');
   await test('integrated and discrete GPUs are told apart', () => {
     const { isUnified } = require('./lib/hardware');

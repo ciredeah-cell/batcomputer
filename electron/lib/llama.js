@@ -84,7 +84,8 @@ class LlamaServer {
       if (this.state === 'stopping') this.setState('stopped');
       else {
         this.lastError = 'llama-server exited (code ' + code + (signal ? ', signal ' + signal : '') + ')'
-          + (wasReady ? '' : '. Last log: ' + this.logLines.slice(-3).join(' | '));
+          + (wasReady ? '' : '. Last log: ' + this.logLines.slice(-3).join(' | '))
+          + diagnose(this.logLines);
         this.setState('error', { error: this.lastError });
       }
     });
@@ -152,6 +153,34 @@ class LlamaServer {
   }
 }
 
+/**
+ * Turn llama.cpp's own failure messages into the next thing to try. The flags
+ * this app emits track a recent llama.cpp; an older build rejects some of them
+ * and dies in under a second, which otherwise reads as an unexplained crash.
+ */
+function diagnose(lines) {
+  const text = lines.slice(-25).join('\n');
+  if (/invalid argument|unknown argument|unrecognized|error while handling argument/i.test(text)) {
+    return '\n\nThat looks like an argument this llama.cpp build does not know. '
+      + 'Set flash attention to "auto" in the Offload tab (it omits the flag entirely), '
+      + 'clear anything in extraArgs, or update llama.cpp -- --n-cpu-moe and --flash-attn on '
+      + 'both need a reasonably recent build.';
+  }
+  if (/failed to allocate|allocation[^\n]*failed|out of memory|cudaMalloc|ErrorOutOfDeviceMemory|unable to allocate/i.test(text)) {
+    return '\n\nThat is an allocation failure: the model plus its KV cache did not fit. '
+      + 'Apply the Budget tab\'s suggestion (usually --n-cpu-moe or a smaller context), '
+      + 'or raise the graphics memory carve-out in your GPU driver.';
+  }
+  if (/failed to load model|unable to load model|no such file/i.test(text)) {
+    return '\n\nllama-server could not read the model file. Check the path is still right '
+      + 'and that a multi-part GGUF has all of its shards next to the first one.';
+  }
+  if (/bind|address already in use|EADDRINUSE/i.test(text)) {
+    return '\n\nSomething else is already on that port. Change it in the Offload tab.';
+  }
+  return '';
+}
+
 function quoteCmd(bin, args) {
   const q = (s) => (/[\s"]/.test(s) ? '"' + s.replace(/"/g, '\\"') + '"' : s);
   return [bin, ...args].map(q).join(' ');
@@ -180,4 +209,4 @@ function findLlamaServer(configured) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-module.exports = { LlamaServer, findLlamaServer, STATES };
+module.exports = { LlamaServer, findLlamaServer, STATES, __diagnose: diagnose };
