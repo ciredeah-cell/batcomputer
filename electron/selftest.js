@@ -32,7 +32,7 @@ async function test(name, fn) {
   catch (err) { failures.push({ name, err }); console.log('  FAIL ' + name + '\n       ' + err.message); }
 }
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'laguna-deck-test-'));
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'batcomputer-test-'));
 
 /* --------------------------- mock llama-server ---------------------------- */
 
@@ -66,7 +66,7 @@ const textChunk = (text, finish = null) => ({
 /* --------------------------------- tests --------------------------------- */
 
 async function main() {
-  console.log('\nlaguna-deck self-test\n');
+  console.log('\nbatcomputer self-test\n');
 
   console.log('syntax');
   await test('every source file parses', () => {
@@ -85,7 +85,7 @@ async function main() {
   });
 
   console.log('\ngguf reader');
-  const modelFile = buildGGUF(path.join(tmp, 'laguna-xs-test.gguf'));
+  const modelFile = buildGGUF(path.join(tmp, 'fixture-moe.gguf'));
   let summary;
   await test('reads MoE metadata from a real header', () => {
     const r = gguf.readGGUF(modelFile);

@@ -1,11 +1,11 @@
 {
-  "name": "laguna-deck",
-  "productName": "Laguna Deck",
+  "name": "batcomputer",
+  "productName": "Batcomputer",
   "version": "0.1.0",
-  "description": "A local-model control deck for Windows: agentic chat over llama.cpp with offload planning for unified-memory boxes, plus Claude Code and GitHub Copilot CLI as drop-in drivers.",
+  "description": "A local-AI console for Windows: agentic chat over llama.cpp with offload planning for unified-memory boxes, plus Claude Code, GitHub Copilot and ComfyUI as drop-in drivers.",
   "main": "electron/main.js",
   "license": "MIT",
-  "author": "ciredeah",
+  "author": "Batcomputer",
   "private": true,
   "scripts": {
     "start": "electron .",
@@ -13,19 +13,20 @@
     "selftest": "node electron/selftest.js",
     "dist": "electron-builder --win",
     "dist:dir": "electron-builder --win --dir",
-    "smoke": "node -e \"process.env.LAGUNA_SMOKE='1';const r=require('child_process').spawnSync(require('electron'),['.'],{stdio:'inherit',env:process.env});process.exit(r.status||0)\""
+    "smoke": "node -e \"process.env.BAT_SMOKE='1';const r=require('child_process').spawnSync(require('electron'),['.'],{stdio:'inherit',env:process.env});process.exit(r.status||0)\""
   },
   "devDependencies": {
     "electron": "^33.4.11",
     "electron-builder": "^25.0.0"
   },
   "build": {
-    "appId": "dev.ciredeah.lagunadeck",
-    "productName": "Laguna Deck",
+    "appId": "io.github.batcomputer.app",
+    "productName": "Batcomputer",
     "files": [
       "electron/**/*",
       "renderer/**/*",
-      "package.json"
+      "package.json",
+      "build/icon.*"
     ],
     "win": {
       "target": [
@@ -41,12 +42,14 @@
             "x64"
           ]
         }
-      ]
+      ],
+      "icon": "build/icon.ico"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "perMachine": false
-    }
+    },
+    "icon": "build/icon.png"
   }
 }

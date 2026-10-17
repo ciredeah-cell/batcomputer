@@ -12,7 +12,7 @@ const MAX_TURNS = 40;
 
 function systemPrompt({ workspace, shell, modelName, approvalMode, extraDirs }) {
   const lines = [
-    'You are the local coding agent inside Laguna Deck, running on ' + os.type() + ' as ' + (modelName || 'a local model') + '.',
+    'You are the local coding agent inside Batcomputer, running on ' + os.type() + ' as ' + (modelName || 'a local model') + '.',
     '',
     'Environment:',
     '- Working directory: ' + workspace,

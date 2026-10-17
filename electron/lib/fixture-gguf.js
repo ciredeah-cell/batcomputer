@@ -7,7 +7,7 @@ const fs = require('fs');
 function buildFixtureGGUF(file, opts = {}) {
   const {
     layers = 24, experts = 64, used = 8, embd = 2048,
-    heads = 16, kvHeads = 4, name = 'Laguna XS (fixture)', padBytes = 1 << 20,
+    heads = 16, kvHeads = 4, name = 'Fixture MoE', padBytes = 1 << 20,
   } = opts;
 
   const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v); return b; };

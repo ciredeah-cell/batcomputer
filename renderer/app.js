@@ -1,5 +1,5 @@
 'use strict';
-/* Laguna Deck renderer. Vanilla DOM on purpose: no build step, no framework,
+/* Batcomputer renderer. Vanilla DOM on purpose: no build step, no framework,
    nothing to update when Electron moves. All model and tool output goes in via
    textContent -- never innerHTML -- so a model that emits markup cannot inject
    anything into the UI. */
@@ -31,6 +31,7 @@ const state = {
   sessionId: null,
   sample: null,                             // latest memory sample
   pendingComfyDir: null,
+  lastAssistantText: null,                  // guards against double-reported replies
 };
 
 /* ------------------------------- utilities ------------------------------- */
@@ -118,7 +119,7 @@ async function boot() {
   } else if (b.session && b.session.driver && b.session.driver.kind) {
     selectDriver({ kind: b.session.driver.kind, modelId: b.session.driver.modelId }, { silent: true });
   }
-  setStatus('Idle');
+  setStatus('Systems nominal');
 }
 
 function renderHardwareLine() {
@@ -383,6 +384,7 @@ function clearEmptyState() {
 }
 
 function clearTranscript() {
+  state.lastAssistantText = null;
   transcriptEl().textContent = '';
   $('#approvalTray').textContent = '';
   state.toolCards.clear();
@@ -474,6 +476,14 @@ function streamReasoning(text) {
 }
 
 function endStream(finalText) {
+  // An agent that reports its answer twice (Claude Code sends it as an
+  // assistant message and again in the result that ends the turn) must not
+  // render it twice.
+  if (finalText && finalText.trim() && finalText.trim() === state.lastAssistantText) {
+    state.streaming = null;
+    return;
+  }
+  if (finalText && finalText.trim()) state.lastAssistantText = finalText.trim();
   if (!state.streaming) {
     if (finalText) addMessage('assistant', finalText);
     return;
@@ -734,6 +744,7 @@ async function send() {
   autosize(input);
   addMessage('user', text);
   $('#turnStats').textContent = '';
+  state.lastAssistantText = null;
   setBusy(true);
   setStatus('Sending…', 'busy');
 
@@ -818,7 +829,7 @@ function renderMemory() {
     ['Free', fmtBytes(s.freeBytes)],
     ...Object.entries(s.procs || {}).map(([name, p]) => [name + ' (pid ' + p.pid + ')', fmtBytes(p.rssBytes)]),
   ];
-  if (rows.length === 1) rows.push(['Deck processes', 'none running']);
+  if (rows.length === 1) rows.push(['Console processes', 'none running']);
   for (const [k, v] of rows) grid.append(el('dt', {}, k), el('dd', {}, v));
 
   const gpuBlock = $('#gpuBlock');
@@ -1460,5 +1471,6 @@ function showScanResults(r) {
 
 // Exposed for the headless smoke check in main.js; handy in devtools too.
 window.__deckState = state;
+window.__deckTest = { onEvent, addMessage };
 
 boot();

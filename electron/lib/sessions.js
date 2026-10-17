@@ -82,6 +82,13 @@ class SessionStore {
   append(id, entry) {
     const s = this.load(id);
     if (!s) return null;
+    // Claude Code reports its final answer twice -- once as an assistant
+    // message, once in the result event that closes the turn. Recording both
+    // would duplicate the reply in every restored transcript.
+    if (entry.role === 'assistant' && entry.text) {
+      const prev = [...s.entries].reverse().find((e) => e.role === 'assistant' && e.text);
+      if (prev && prev.text.trim() === String(entry.text).trim()) return s;
+    }
     s.entries.push({ at: new Date().toISOString(), ...entry });
     if (s.entries.length > MAX_ENTRIES) s.entries.splice(0, s.entries.length - MAX_ENTRIES);
     s.updatedAt = new Date().toISOString();

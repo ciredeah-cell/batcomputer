@@ -17,13 +17,13 @@ const { Monitor } = require('./lib/monitor');
 const comfy = require('./lib/comfy');
 
 const isDev = process.argv.includes('--dev');
-const isSmoke = process.env.LAGUNA_SMOKE === '1';
+const isSmoke = process.env.BAT_SMOKE === '1';
 
 // The smoke check runs against a throwaway profile: it must never read or
 // write the real one, and it has to start from the same blank state every time
 // or its assertions drift with whatever the last run left behind.
 if (isSmoke) {
-  const smokeDir = path.join(require('os').tmpdir(), 'laguna-deck-smoke-' + process.pid);
+  const smokeDir = path.join(require('os').tmpdir(), 'batcomputer-smoke-' + process.pid);
   fs.rmSync(smokeDir, { recursive: true, force: true });
   fs.mkdirSync(smokeDir, { recursive: true });
   app.setPath('userData', smokeDir);
@@ -207,7 +207,8 @@ function createWindow() {
     minWidth: 980,
     minHeight: 640,
     backgroundColor: '#0e1116',
-    title: 'Laguna Deck',
+    title: 'Batcomputer',
+    icon: path.join(__dirname, '..', 'build', 'icon.png'),
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -229,7 +230,7 @@ function createWindow() {
 }
 
 /**
- * Headless boot check (LAGUNA_SMOKE=1, or `npm run smoke`): load the real
+ * Headless boot check (BAT_SMOKE=1, or `npm run smoke`): load the real
  * window, then assert the renderer actually bootstrapped instead of dying on an
  * exception nobody sees. Catches the whole main-to-renderer path -- preload
  * bridge, IPC, first render -- which the node-only self-test cannot reach.
@@ -264,7 +265,7 @@ async function runSmoke() {
   // it, so the budget meter, the advice list and the offload form all render
   // for real. Those are the renderer's most involved paths.
   const { buildFixtureGGUF } = require('./lib/fixture-gguf');
-  const fixture = path.join(app.getPath('temp'), 'laguna-deck-smoke.gguf');
+  const fixture = path.join(app.getPath('temp'), 'batcomputer-smoke.gguf');
   buildFixtureGGUF(fixture, { name: 'Smoke XS' });
   const added = await wc.executeJavaScript(
     'window.deck.models.add({ modelPath: ' + JSON.stringify(fixture) + ' })');
@@ -347,13 +348,13 @@ async function runSmoke() {
   if (added && added.ok === false) console.log('  model add failed: ' + added.error);
   try { fs.unlinkSync(fixture); } catch (_) { /* best effort */ }
 
-  // LAGUNA_SMOKE_SHOT=<path> saves a PNG of the loaded window, for eyeballing
+  // BAT_SMOKE_SHOT=<path> saves a PNG of the loaded window, for eyeballing
   // the layout on a machine with no display.
-  if (process.env.LAGUNA_SMOKE_SHOT) {
+  if (process.env.BAT_SMOKE_SHOT) {
     try {
       const shot = async (suffix) => {
         const img = await wc.capturePage();
-        const file = process.env.LAGUNA_SMOKE_SHOT.replace(/\.png$/, '') + suffix + '.png';
+        const file = process.env.BAT_SMOKE_SHOT.replace(/\.png$/, '') + suffix + '.png';
         fs.writeFileSync(file, img.toPNG());
         console.log('  screenshot: ' + file);
       };
@@ -374,11 +375,11 @@ function createTray() {
   try {
     const img = nativeImage.createFromDataURL(TRAY_ICON);
     tray = new Tray(img);
-    tray.setToolTip('Laguna Deck');
+    tray.setToolTip('Batcomputer');
     const refresh = () => {
       const st = llama ? llama.status() : { state: 'stopped' };
       tray.setContextMenu(Menu.buildFromTemplate([
-        { label: 'Laguna Deck', enabled: false },
+        { label: 'Batcomputer', enabled: false },
         { label: 'Model: ' + st.state + (st.modelId ? '' : ' (none loaded)'), enabled: false },
         { type: 'separator' },
         { label: 'Show window', click: () => { if (!win) createWindow(); else win.show(); } },
@@ -392,8 +393,8 @@ function createTray() {
   } catch (_) { /* a tray is a nicety, not a requirement */ }
 }
 
-// A 16x16 teal square: enough to be findable in the tray without shipping a binary asset.
-const TRAY_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAPElEQVR42mNkIAIwDg0wGBkZGf4zMDAwMDAwMPxnYGBgYGBgYPjPwMDAwMDAwPCfgYGBgYGBgeE/AwMDAwMDAwBvRwgBkmQ1cQAAAABJRU5ErkJggg==';
+// The sigil, inline, so the tray works without shipping a separate asset file.
+const TRAY_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAACsElEQVR4nO2VTWgTQRiG329mdmNssimtFixUwYuI4rW9pf4gemhrD1vwIoi1Fy9eFKTI2puI4NmL0IOXBC3agxX/YkGloOAPFpQqKAjS2NakZZPsz3weamKq0Jog1EOey+zCzvu9887sN0CDBg3WGap3IvOvuUTgf2NnHag5AWYQEdh93NcREMdFSGZT961X9aagfhcHbIHM7LKxbBvDTmugKuZMUgKPAx96kBhBSLxn6Wn/KWBstmyuonUBhF02YfNPve5uTTSiq2tWEuCULWkgHa61erwYUlh8xzlYH4kwKQQd0hpnrWRkFG8haXfaW1UjZUvYaV02umILHAfizMH+w4aBLq8YLngBT7Vsik/PufNha2fnkqARzQByj3q6mpqMZ67r56NRFXeL4cNE8vaBZZOOAIC5O1OxqDJjZoJ2ugVORjbIhWIhGG/eOz6zIgFmCGSSpqusY8qQw6ZlbnXnSlCKYMYNFHOe9n1+qQljphQdIKZAc0wKYetAK6kEPD/8ZBjiRuBry4ioz14psJSkk0qJRCSqsJT3EIsZAAOFQjDml/icte/2ewAQAPibkTCUUHko+rCYLQy6xJZf9La486XLmum6IjqSaI1cCvxgmJm/xqLG0dAPBQPw/FA3RdU2MHqJeXT69eeLCW45rySOk6K7S7nS/pjpJebm/V1uIUgxUJSCon+cgVrIT/ZeicfN0/lcyVeSJAlyv38pbW8fmMhWH8S/QZQfOGVLZlB5dBwITtmSHUeUmw6nbMkpWyLUV4sF3yMivXGjITxP32wfmMjy8yHj11/gCGau6C2/OxXNehZeMQoA+UzPNZ45yu6TviD3oHdHuUitenU1IgBYuG9bsZbwhLvgv2k+MH6v1uj/KdX3Qq2otT9ZpWgmKZFtY6LVG1iDBg0aNPiv+QEYKU5GVADIGAAAAABJRU5ErkJggg==';
 
 /* ---------------------------------- IPC ---------------------------------- */
 

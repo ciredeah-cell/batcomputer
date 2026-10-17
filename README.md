@@ -1,4 +1,4 @@
-# Laguna Deck
+# Batcomputer
 
 A Windows control deck for local models and coding agents. One window, one
 workspace, one set of approval rules — and four interchangeable drivers:
@@ -13,7 +13,7 @@ workspace, one set of approval rules — and four interchangeable drivers:
 Built for a unified-memory mini PC (Ryzen AI Max class, where system RAM *is*
 graphics memory), so the hard part isn't the chat — it's knowing whether a model
 plus its KV cache fits the graphics carve-out, and what to move when it doesn't.
-That's what the Deck panel is for, and why a live memory gauge sits in the
+That's what the right-hand panel is for, and why a live memory gauge sits in the
 corner of every screen.
 
 Every conversation is saved. Sessions appear in the sidebar with their titles
@@ -21,22 +21,22 @@ and message counts, switching between them restores both the transcript *and*
 the model's memory of it, and closing the app is not the same as losing your
 work.
 
-Primary driver is **Laguna XS**; anything else GGUF works the same way.
+Point it at whatever GGUF you drive with day to day; everything else works the same way.
 
 ---
 
 ## Install
 
 **The easy way.** Grab the installer from
-[Releases](../../releases) — `Laguna-Deck-Setup-x.y.z.exe` — or the portable
+[Releases](../../releases) — `Batcomputer-Setup-x.y.z.exe` — or the portable
 `.zip` if you'd rather not install anything. Both are built on Windows by CI
 from the tagged commit.
 
 **From source** (Node 20+):
 
 ```powershell
-git clone https://github.com/<owner>/laguna-deck.git
-cd laguna-deck
+git clone https://github.com/<owner>/batcomputer.git
+cd batcomputer
 npm install
 npm start
 ```
@@ -108,7 +108,7 @@ tell at a glance which ones are ready.
    *Scan a models folder* to walk a directory. The deck reads each file's GGUF
    header — architecture, quantisation, expert count, context length — without
    loading the weights.
-3. **Read the Deck panel** before you load anything big. It shows weights, KV
+3. **Read the right-hand panel** before you load anything big. It shows weights, KV
    cache, and compute buffers against your budget, and what to change if the sum
    is over. Every suggestion has an **Apply** button.
 4. **Talk to it.** Tool calls appear as cards. Writes and commands wait for your
@@ -169,10 +169,10 @@ shell operators: `git log | rm -rf x` is classified by the `rm`, not the `git`.
 
 ---
 
-## The Deck panel
+## The right-hand panel
 
 **System** — live memory, sampled every two seconds. A gauge of system RAM with
-the share held by the deck's own processes (llama-server, ComfyUI, the CLI
+the share held by the console's own processes (llama-server, ComfyUI, the CLI
 agents) called out separately, a three-minute history chart with the GPU budget
 marked on it, and per-process numbers. On a unified-memory box this is the
 honest picture: whatever a model holds is RAM Windows cannot have. Dedicated
