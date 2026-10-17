@@ -11,8 +11,8 @@
     "start": "electron .",
     "dev": "electron . --dev",
     "selftest": "node electron/selftest.js",
-    "dist": "electron-builder --win",
-    "dist:dir": "electron-builder --win --dir",
+    "dist": "electron-builder --win --publish never",
+    "dist:dir": "electron-builder --win --dir --publish never",
     "smoke": "node -e \"process.env.BAT_SMOKE='1';const r=require('child_process').spawnSync(require('electron'),['.'],{stdio:'inherit',env:process.env});process.exit(r.status||0)\""
   },
   "devDependencies": {
