@@ -359,6 +359,11 @@ async function runSmoke() {
         console.log('  screenshot: ' + file);
       };
       await shot('-offload');
+      await wc.executeJavaScript("document.querySelector('#comfyRow').click()");
+      await new Promise((r) => setTimeout(r, 600));
+      await shot('-comfy');
+      await wc.executeJavaScript("document.querySelector('#modelList li.driver').click()");
+      await new Promise((r) => setTimeout(r, 400));
       for (const tab of ['budget', 'system']) {
         await wc.executeJavaScript('document.querySelector(\'.deck-tabs .tab[data-tab="' + tab + '"]\').click()');
         await new Promise((r) => setTimeout(r, 600));

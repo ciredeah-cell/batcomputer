@@ -1,14 +1,14 @@
 # Batcomputer
 
-A Windows control deck for local models and coding agents. One window, one
+A Windows console for local models and coding agents. One window, one
 workspace, one set of approval rules — and four interchangeable drivers:
 
 | Driver | What it is | How it runs |
 |---|---|---|
-| **Local model** | Any GGUF through `llama-server`, with an agent loop and real tools | Spawned and supervised by the deck |
-| **Claude Code** | The `claude` CLI, with its own tools and permissions | Launched as a live session inside the deck |
+| **Local model** | Any GGUF through `llama-server`, with an agent loop and real tools | Spawned and supervised by Batcomputer |
+| **Claude Code** | The `claude` CLI, with its own tools and permissions | Launched as a live session inside Batcomputer |
 | **GitHub Copilot** | The `copilot` CLI | Launched per turn, context carried with `--continue` |
-| **ComfyUI** | Local image generation | Installed, started and stopped by the deck; opens in a browser or a deck window |
+| **ComfyUI** | Local image generation | Installed, started and stopped by Batcomputer; opens in a browser or its own window |
 
 Built for a unified-memory mini PC (Ryzen AI Max class, where system RAM *is*
 graphics memory), so the hard part isn't the chat — it's knowing whether a model
@@ -59,7 +59,7 @@ anywhere, then point **Settings → llama-server binary** at `llama-server.exe`.
 ROCm/HIP is also selectable in Settings. It's worth trying if you spend a lot of
 time at very long context — it processes prompts faster there — but Vulkan is
 usually as fast or faster at generation on this class of iGPU, and it's the
-sane default. Picking ROCm makes the deck set `ROCBLAS_USE_HIPBLASLT=1`, which
+sane default. Picking ROCm makes it set `ROCBLAS_USE_HIPBLASLT=1`, which
 is the single biggest prompt-processing win on gfx1151.
 
 ### 2. The graphics memory carve-out (do this once)
@@ -72,11 +72,11 @@ that number, so a wrong value gives confidently wrong advice.
 
 Spilling past the carve-out into shared memory doesn't fail — it just collapses
 throughput, which is much harder to diagnose than an out-of-memory error. The
-deck warns you before loading something that won't fit.
+it warns you before loading something that won't fit.
 
 ### 3. ComfyUI (optional)
 
-Select **ComfyUI** in the sidebar. If it's already on the machine the deck finds
+Select **ComfyUI** in the sidebar. If it's already on the machine Batcomputer finds
 it and just needs a Start; if it isn't, the panel offers to set it up: it clones
 the repo, builds a private Python environment beside it, and installs the torch
 build you choose. On an AMD Windows box that's **DirectML**, which works on any
@@ -85,12 +85,12 @@ whole install streams into the log so a failure at step four is something you
 can finish by hand.
 
 Once it's running, its memory shows up on the same gauge as everything else, and
-**Open in a deck window** puts the interface in its own window instead of a
+**Open in its own window** puts the interface in its own window instead of a
 browser tab.
 
 ### 4. The CLI agents (optional, per driver)
 
-- **Claude Code** — install it and run `claude` once to sign in. The deck finds
+- **Claude Code** — install it and run `claude` once to sign in. Batcomputer finds
   it on `PATH`, or you can point Settings at the binary.
 - **GitHub Copilot CLI** — install it and run `copilot` once to sign in, or set
   `COPILOT_GITHUB_TOKEN` in the environment.
@@ -105,7 +105,7 @@ tell at a glance which ones are ready.
 1. **Pick a workspace** (bottom left). Every tool call, every file edit, and
    every CLI session runs there, and the local agent is confined to it.
 2. **Add a model**: `+` next to *Local models* for a single GGUF, or
-   *Scan a models folder* to walk a directory. The deck reads each file's GGUF
+   *Scan a models folder* to walk a directory. It reads each file's GGUF
    header — architecture, quantisation, expert count, context length — without
    loading the weights.
 3. **Read the right-hand panel** before you load anything big. It shows weights, KV
@@ -143,10 +143,10 @@ everything else, tool calls included.
 - **Claude Code** runs as one long-lived process (`-p` with
   `--input-format stream-json`), so context persists across turns in-session and
   you can see token-level streaming. Pick its permission mode in Settings —
-  nothing inside the deck can answer an interactive permission prompt, so
+  nothing inside Batcomputer can answer an interactive permission prompt, so
   `acceptEdits` or `auto` is the useful setting, and `plan` is the cautious one.
 - **GitHub Copilot** is one process per turn, which is how its `-p` mode works;
-  the deck passes `--continue` after the first turn so the thread carries. Its
+  Batcomputer passes `--continue` after the first turn so the thread carries. Its
   deny list (Settings) outranks `--allow-all-tools`, so destructive shell verbs
   stay blocked even with broad permission on.
 - **Terminal** hands the agent to a real terminal window — Windows Terminal if
@@ -229,7 +229,7 @@ meter will show it, and the fix is the same: smaller KV cache, more
 
 **The model talks about calling a tool but nothing runs** — its chat template
 isn't producing structured tool calls. Check `--jinja` is on in the Offload tab.
-The deck also recovers `<tool_call>{…}</tool_call>` and fenced-JSON shapes from
+Batcomputer also recovers `<tool_call>{…}</tool_call>` and fenced-JSON shapes from
 plain text and marks those cards `text`, but a template fix is better.
 
 **Claude Code launches and immediately ends** — it's almost always auth or
@@ -244,7 +244,7 @@ both on PATH, and says which one is missing. Install those first. If the torch
 step fails, the log has the exact `pip` command that failed, which you can run
 yourself in `ComfyUI/.venv`.
 
-**Bandwidth shows "unknown"** — the deck only derives bandwidth for CPUs it
+**Bandwidth shows "unknown"** — it only derives bandwidth for CPUs it
 recognises. Everything still works; the throughput estimate is just omitted
 rather than guessed.
 
@@ -271,7 +271,7 @@ electron/
     backends/local.js  OpenAI-compatible streaming, tool-call assembly + recovery
     cli-agent.js       Claude Code and Copilot CLI session drivers
 renderer/
-  index.html           sidebar, transcript, deck panel, settings
+  index.html           sidebar, transcript, side panel, settings
   app.js               state, event handling, offload form, approval cards
   styles.css           one stylesheet, no frameworks
 ```
@@ -302,7 +302,7 @@ Two test commands, both headless, both in CI:
   shortcut here.
 - **Windows-first.** The code runs on Linux (that's where the tests run) but the
   hardware probe, the installer, and the tuning advice target Windows.
-- **ComfyUI is launched, not embedded.** The deck manages the process and the
+- **ComfyUI is launched, not embedded.** Batcomputer manages the process and the
   environment; the node editor is ComfyUI's own interface.
 
 MIT.

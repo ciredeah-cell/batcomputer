@@ -160,7 +160,7 @@ function renderRail() {
         el('div', { class: 'driver-name' }, m.name, m.isPrimary ? el('span', { class: 'badge' }, 'primary') : null),
         el('div', { class: 'driver-meta', title: m.modelPath }, meta)),
       el('button', {
-        class: 'icon-btn', title: 'Remove from the deck',
+        class: 'icon-btn', title: 'Remove from the library',
         onclick: async (e) => {
           e.stopPropagation();
           await window.deck.models.remove({ id: m.id });
@@ -812,7 +812,7 @@ function renderMemory() {
   $('#ramModelText').textContent = procBytes ? fmtGBshort(procBytes) + ' GB loaded' : '';
   drawSpark($('#ramSpark'), s.history, s.totalBytes, 26);
 
-  // deck system pane
+  // system pane in the side panel
   $('#sysNums').textContent = fmtBytes(s.usedBytes) + ' / ' + fmtBytes(s.totalBytes) + '  (' + s.usedPct + '%)'
     + (s.history.length < 6 ? '  · collecting' : '');
   $('.gauge').className = 'gauge ' + level;
@@ -876,7 +876,7 @@ function drawSpark(canvas, history, total, height, opts = {}) {
   ctx.fillStyle = 'rgba(59, 74, 99, 0.55)';
   ctx.fill();
 
-  // the share held by the deck's own processes
+  // the share held by this app's own processes
   ctx.beginPath();
   ctx.moveTo(0, height);
   pts.forEach((p, i) => ctx.lineTo(x(i), y(p.modelBytes || 0)));
@@ -1002,7 +1002,7 @@ function renderLog() {
   const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 40;
   pre.textContent = lines.length
     ? lines.join('\n')
-    : (state.logView === 'comfy' ? 'ComfyUI has not been started from the deck yet.' : 'No llama-server output yet.');
+    : (state.logView === 'comfy' ? 'ComfyUI has not been started from here yet.' : 'No llama-server output yet.');
   if (stick) pre.scrollTop = pre.scrollHeight;
 }
 
@@ -1087,7 +1087,7 @@ function renderProfileForm() {
     el('button', { class: 'pill-btn primary', onclick: () => loadActiveModel() }, 'Load with these settings'),
     el('button', { class: 'pill-btn', onclick: async () => { await window.deck.llama.stop(); } }, 'Unload')));
   host.append(el('p', { class: 'deck-note' },
-    'Changes save as you make them and take effect on the next load. Anything the deck does not expose can go in extraArgs in config.json.'));
+    'Changes save as you make them and take effect on the next load. Anything this panel does not expose can go in extraArgs in config.json.'));
 }
 
 /* ------------------------------- ComfyUI view ---------------------------- */
@@ -1107,8 +1107,8 @@ function renderComfyView() {
   stateEl.className = 'comfy-state ' + (running ? 'ready' : st.state === 'error' ? 'error' : working ? 'working' : '');
 
   $('#comfyBlurb').textContent = info.installed
-    ? 'Image generation, running locally. The deck starts and stops the server and keeps its memory use on the same gauge as everything else; the interface itself opens in a browser or in a deck window.'
-    : 'ComfyUI is the node-based image generator. The deck can set it up for you: it clones the repo, builds a private Python environment beside it, and installs a torch build that matches this machine. Nothing is installed system-wide.';
+    ? 'Image generation, running locally. Batcomputer starts and stops the server and keeps its memory use on the same gauge as everything else; the node editor itself opens in a browser or in its own window.'
+    : 'ComfyUI is the node-based image generator. Batcomputer can set it up for you: it clones the repo, builds a private Python environment beside it, and installs a torch build that matches this machine. Nothing is installed system-wide.';
 
   $('#comfyPathRow').hidden = !info.installed;
   $('#btnComfyDir').textContent = info.dir ? shortPath(info.dir, 40) : 'choose…';
