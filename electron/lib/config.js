@@ -13,8 +13,16 @@ const DEFAULTS = {
   modelsDir: null,
   models: [],                   // [{ id, name, modelPath, profile, meta, isPrimary }]
   activeModelId: null,
-  driver: 'local',              // local | claude-code | copilot
+  driver: 'local',              // local | claude-code | copilot | comfy
   approvalMode: 'ask',          // ask | acceptEdits | yolo
+  activeSessionId: null,
+  comfy: {
+    dir: null,                  // null = autodetect
+    python: null,               // null = the install's own venv, else system
+    port: 8188,
+    flavor: 'directml',         // see comfy.TORCH_FLAVORS
+    extraArgs: [],
+  },
   shell: null,                  // null = powershell on win32, bash elsewhere
   cli: {
     claude: {

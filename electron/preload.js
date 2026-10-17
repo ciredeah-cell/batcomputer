@@ -55,6 +55,27 @@ contextBridge.exposeInMainWorld('deck', {
     openTerminal: invoke('cli:openTerminal'),
   },
 
+  sessions: {
+    list: invoke('sessions:list'),
+    create: invoke('sessions:new'),
+    switch: invoke('sessions:switch'),
+    remove: invoke('sessions:delete'),
+    rename: invoke('sessions:rename'),
+    get: invoke('sessions:get'),
+  },
+
+  monitor: { sample: invoke('monitor:sample') },
+
+  comfy: {
+    detect: invoke('comfy:detect'),
+    install: invoke('comfy:install'),
+    start: invoke('comfy:start'),
+    stop: invoke('comfy:stop'),
+    status: invoke('comfy:status'),
+    open: invoke('comfy:open'),
+    pickDir: invoke('comfy:pickDir'),
+  },
+
   openPath: invoke('shell:openPath'),
   openExternal: invoke('shell:openExternal'),
 

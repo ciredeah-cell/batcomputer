@@ -21,6 +21,8 @@ const local = require('./lib/backends/local');
 const { LocalAgent } = require('./lib/agent');
 const cli = require('./lib/cli-agent');
 const { buildFixtureGGUF: buildGGUF } = require('./lib/fixture-gguf');
+const { SessionStore } = require('./lib/sessions');
+const comfy = require('./lib/comfy');
 
 let passed = 0;
 const failures = [];
@@ -417,6 +419,69 @@ async function main() {
     const res = events.find((e) => e.type === 'cli:result');
     assert.strictEqual(res.text, 'all done');
     assert.ok(events.some((e) => e.type === 'cli:delta' && /plain progress/.test(e.text)));
+  });
+
+  console.log('\nsessions');
+  await test('a session records a transcript and names itself from the first turn', () => {
+    const store = new SessionStore(path.join(tmp, 'store'));
+    const s = store.create({ driver: { kind: 'local', modelId: 'm1' } });
+    assert.strictEqual(s.title, 'New session');
+    store.append(s.id, { role: 'user', text: 'Explain the retry logic in worker.ts' });
+    store.append(s.id, { role: 'assistant', text: 'It retries three times.' });
+    store.append(s.id, { role: 'tool', id: 't1', name: 'read_file', preview: 'read worker.ts' });
+    const loaded = store.load(s.id);
+    assert.match(loaded.title, /^Explain the retry logic/);
+    assert.strictEqual(loaded.entries.length, 3);
+    const row = store.list().find((x) => x.id === s.id);
+    assert.strictEqual(row.messageCount, 2, 'tool entries are not messages');
+    assert.strictEqual(row.toolCount, 1);
+  });
+  await test('model-facing history survives a restart', () => {
+    const dir = path.join(tmp, 'store2');
+    const store = new SessionStore(dir);
+    const s = store.create({});
+    store.setAgentMessages(s.id, [{ role: 'system', content: 'sys' }, { role: 'user', content: 'hi' }]);
+    store.flushAll();
+    const reopened = new SessionStore(dir);          // fresh process would do this
+    const again = reopened.load(s.id);
+    assert.strictEqual(again.agent.length, 2);
+    assert.strictEqual(again.agent[1].content, 'hi');
+  });
+  await test('deleting a session removes it from disk', () => {
+    const store = new SessionStore(path.join(tmp, 'store3'));
+    const s = store.create({});
+    store.flushAll();
+    assert.strictEqual(store.list().length, 1);
+    store.remove(s.id);
+    assert.strictEqual(store.list().length, 0);
+    assert.strictEqual(store.load(s.id), null);
+  });
+
+  console.log('\ncomfyui');
+  await test('detect reports a usable setup path when nothing is installed', () => {
+    const d = comfy.detect(path.join(tmp, 'definitely-not-comfy'));
+    assert.strictEqual(d.installed, false);
+    assert.ok(d.suggestedDir, 'should propose somewhere to install');
+    assert.ok('git' in d && 'systemPython' in d, 'should report the prerequisites it checked');
+  });
+  await test('detect accepts a real-looking install', () => {
+    const dir = path.join(tmp, 'ComfyUI');
+    fs.mkdirSync(path.join(dir, 'comfy'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'models', 'checkpoints'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'main.py'), '# comfy');
+    fs.writeFileSync(path.join(dir, 'models', 'checkpoints', 'a.safetensors'), 'x');
+    const d = comfy.detect(dir);
+    assert.strictEqual(d.installed, true);
+    assert.strictEqual(d.dir, dir);
+    assert.strictEqual(d.models.checkpoints, 1);
+  });
+  await test('every torch flavor is installable as described', () => {
+    for (const [key, f] of Object.entries(comfy.TORCH_FLAVORS)) {
+      assert.ok(f.label && f.note, key + ' needs a label and a note');
+      assert.ok(Array.isArray(f.packages) && f.packages.length, key + ' needs packages');
+      assert.ok(Array.isArray(f.launchArgs), key + ' needs launch args');
+    }
+    assert.ok(comfy.TORCH_FLAVORS.directml.launchArgs.includes('--directml'));
   });
 
   console.log('\nconfig');

@@ -10,6 +10,9 @@ const state = {
   config: null,
   hw: null,
   cli: null,
+  comfy: null,            // detection result
+  comfyStatus: null,      // server state
+  comfyFlavors: {},
   platform: 'win32',
   llama: { state: 'stopped' },
   driver: { kind: null, modelId: null },   // what the composer talks to
@@ -20,7 +23,14 @@ const state = {
   toolCards: new Map(),
   approvals: new Map(),
   serverLog: [],
+  comfyLog: [],
+  logView: 'llama',
+  activity: [],
   cliStatus: {},
+  sessions: [],
+  sessionId: null,
+  sample: null,                             // latest memory sample
+  pendingComfyDir: null,
 };
 
 /* ------------------------------- utilities ------------------------------- */
@@ -52,13 +62,25 @@ function fmtBytes(b) {
   return b + ' B';
 }
 
+function fmtGBshort(b) { return (b / GB).toFixed(1); }
+
 function shortPath(p, max = 42) {
   if (!p) return '—';
   return p.length <= max ? p : '…' + p.slice(-(max - 1));
 }
 
+function ago(iso) {
+  if (!iso) return '';
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+
 function toast(text, kind = 'system') {
   addMessage(kind === 'error' ? 'error' : 'system', text);
+  pushActivity(text);
 }
 
 /* ------------------------------- bootstrap ------------------------------- */
@@ -69,20 +91,34 @@ async function boot() {
   state.config = b.config;
   state.hw = b.hw;
   state.cli = b.cli;
+  state.comfy = b.comfy;
+  state.comfyStatus = b.comfyStatus;
+  state.comfyFlavors = b.comfyFlavors || {};
   state.platform = b.platform;
   state.llama = b.llama;
+  state.sessions = b.sessions || [];
+  state.sessionId = b.session ? b.session.id : null;
+
   renderHardwareLine();
   renderRail();
   renderCliRail();
+  renderComfyRail();
+  renderSessions();
   renderTopbar();
   applyConfigToSettings();
   renderDeck();
+  renderComfyView();
   wireChrome();
   window.deck.onEvent(onEvent);
-  // Restore the last driver so relaunching the app lands where you left off.
+
+  if (b.session) restoreTranscript(b.session);
+  // Land where you left off: same driver, same conversation.
   if (state.config.activeModelId && state.config.models.some((m) => m.id === state.config.activeModelId)) {
     selectDriver({ kind: 'local', modelId: state.config.activeModelId }, { silent: true });
+  } else if (b.session && b.session.driver && b.session.driver.kind) {
+    selectDriver({ kind: b.session.driver.kind, modelId: b.session.driver.modelId }, { silent: true });
   }
+  setStatus('Idle');
 }
 
 function renderHardwareLine() {
@@ -114,7 +150,7 @@ function renderRail() {
       fmtBytes(m.meta && m.meta.sizeBytes),
     ].filter(Boolean).join(' · ');
 
-    const li = el('li', {
+    list.append(el('li', {
       class: 'driver' + (state.driver.kind === 'local' && state.driver.modelId === m.id ? ' active' : ''),
       onclick: () => selectDriver({ kind: 'local', modelId: m.id }),
     },
@@ -132,8 +168,7 @@ function renderRail() {
           if (state.driver.modelId === m.id) state.driver = { kind: null, modelId: null };
           renderRail(); renderTopbar(); renderDeck();
         },
-      }, '×'));
-    list.append(li);
+      }, '×')));
   }
 }
 
@@ -168,16 +203,94 @@ function renderCliRail() {
   });
 }
 
+function renderComfyRail() {
+  const dot = $('#dotComfy');
+  const meta = $('#metaComfy');
+  const st = state.comfyStatus || {};
+  const info = state.comfy || {};
+  if (st.state === 'ready') { dot.className = 'dot ready'; meta.textContent = 'running on :' + st.port; }
+  else if (st.state === 'starting' || st.state === 'installing') { dot.className = 'dot busy'; meta.textContent = st.state + '…'; }
+  else if (st.state === 'error') { dot.className = 'dot error'; meta.textContent = 'failed — see the log'; }
+  else if (info.installed) {
+    dot.className = 'dot';
+    const models = Object.values(info.models || {}).reduce((a, b) => a + b, 0);
+    meta.textContent = 'installed' + (models ? ' · ' + models + ' model files' : ' · no models yet');
+  } else { dot.className = 'dot absent'; meta.textContent = 'not installed — one click to set up'; }
+  meta.title = info.dir || '';
+  $('#comfyRow').classList.toggle('active', state.driver.kind === 'comfy');
+  $('#comfyRow').onclick = () => selectDriver({ kind: 'comfy', modelId: null });
+}
+
+function renderSessions() {
+  const list = $('#sessionList');
+  list.textContent = '';
+  if (!state.sessions.length) {
+    list.append(el('li', { class: 'session-empty' }, 'Conversations you start are saved here.'));
+    return;
+  }
+  for (const s of state.sessions.slice(0, 40)) {
+    const current = s.id === state.sessionId;
+    list.append(el('li', {
+      class: 'session' + (current ? ' current' : ''),
+      onclick: () => switchSession(s.id),
+      title: s.title,
+    },
+      el('div', { class: 'session-body' },
+        el('div', { class: 'session-title' }, s.title),
+        el('div', { class: 'session-meta' },
+          [s.messageCount + ' msg', s.toolCount ? s.toolCount + ' tools' : null, ago(s.updatedAt)].filter(Boolean).join(' · '))),
+      el('button', {
+        class: 'icon-btn', title: 'Delete this session',
+        onclick: async (e) => {
+          e.stopPropagation();
+          const r = await window.deck.sessions.remove({ id: s.id });
+          if (!r.ok) return;
+          state.sessions = r.sessions;
+          if (state.sessionId === s.id) { state.sessionId = r.activeId; clearTranscript(); }
+          renderSessions();
+        },
+      }, '×')));
+  }
+}
+
+async function switchSession(id) {
+  if (id === state.sessionId || state.busy) return;
+  const r = await window.deck.sessions.switch({ id });
+  if (!r.ok) { toast(r.error, 'error'); return; }
+  state.sessionId = id;
+  state.sessions = r.sessions;
+  clearTranscript();
+  restoreTranscript(r.session);
+  renderSessions();
+  if (r.session.driver && r.session.driver.kind) {
+    selectDriver({ kind: r.session.driver.kind, modelId: r.session.driver.modelId }, { silent: true });
+  }
+  setStatus('Session restored — ' + r.session.title);
+}
+
 /* ------------------------------ driver switch ---------------------------- */
 
 function selectDriver(driver, { silent = false } = {}) {
   state.driver = driver;
   renderRail();
   renderCliRail();
+  renderComfyRail();
   renderTopbar();
+  renderViewMode();
   if (driver.kind === 'local' && driver.modelId) refreshPlan(driver.modelId);
+  if (driver.kind === 'comfy') renderComfyView();
   renderProfileForm();
-  if (!silent) $('#input').focus();
+  if (!silent && driver.kind !== 'comfy') $('#input').focus();
+}
+
+// ComfyUI is not a chat driver, so it replaces the transcript and composer
+// with its own panel rather than pretending to be one.
+function renderViewMode() {
+  const isComfy = state.driver.kind === 'comfy';
+  $('#transcript').hidden = isComfy;
+  $('#comfyView').hidden = !isComfy;
+  $('#composer').hidden = isComfy;
+  $('#approvalTray').hidden = isComfy;
 }
 
 function renderTopbar() {
@@ -197,12 +310,12 @@ function renderTopbar() {
       ? (st === 'ready'
         ? 'loaded on :' + state.llama.port + (state.plan && state.plan.plan.estTokPerSec ? ' · ~' + state.plan.plan.estTokPerSec + ' tok/s expected' : '')
         : st + '…')
-      : (st === 'error' ? 'failed to load — see Server log' : 'not loaded');
+      : (st === 'error' ? 'failed to load — see the log' : 'not loaded');
     show('#btnLaunch', st !== 'ready' && st !== 'loading' && st !== 'starting');
     $('#btnLaunch').textContent = 'Load model';
     show('#btnUnload', loaded && st === 'ready');
+    $('#btnUnload').textContent = 'Unload';
     show('#btnOpenTerminal', false);
-    show('#btnStop', state.busy);
   } else if (d.kind === 'claude' || d.kind === 'copilot') {
     const label = d.kind === 'claude' ? 'Claude Code' : 'GitHub Copilot';
     const info = state.cli ? state.cli[d.kind] : null;
@@ -219,17 +332,45 @@ function renderTopbar() {
     show('#btnUnload', !!(sess && sess.alive));
     $('#btnUnload').textContent = 'End session';
     show('#btnOpenTerminal', !!(info && info.installed));
-    show('#btnStop', !!(sess && sess.busy));
+  } else if (d.kind === 'comfy') {
+    const st = state.comfyStatus || {};
+    dot.className = 'dot ' + (st.state === 'ready' ? 'ready' : st.state === 'error' ? 'error' : !st.state || st.state === 'stopped' ? '' : 'busy');
+    name.textContent = 'ComfyUI';
+    meta.textContent = st.state === 'ready' ? st.url : (state.comfy && state.comfy.installed ? shortPath(state.comfy.dir, 40) : 'not installed');
+    show('#btnLaunch', false); show('#btnUnload', false); show('#btnOpenTerminal', false);
   } else {
     dot.className = 'dot';
     name.textContent = 'No driver selected';
-    meta.textContent = 'Pick a local model, or launch Claude Code or Copilot';
-    show('#btnLaunch', false); show('#btnUnload', false); show('#btnOpenTerminal', false); show('#btnStop', false);
+    meta.textContent = 'Pick a local model, or launch Claude Code, Copilot or ComfyUI';
+    show('#btnLaunch', false); show('#btnUnload', false); show('#btnOpenTerminal', false);
   }
-  $('#btnSend').disabled = state.busy || !d.kind;
+  show('#btnStop', state.busy);
+  $('#btnSend').disabled = state.busy || !d.kind || d.kind === 'comfy';
   $('#composerHint').textContent = d.kind === 'local'
     ? state.config.approvalMode
-    : d.kind ? (d.kind === 'claude' ? state.config.cli.claude.permissionMode : (state.config.cli.copilot.allowAllTools ? 'all tools allowed' : 'tool prompts disabled')) : '';
+    : d.kind === 'claude' ? state.config.cli.claude.permissionMode
+      : d.kind === 'copilot' ? (state.config.cli.copilot.allowAllTools ? 'all tools allowed' : 'tool prompts disabled')
+        : '';
+}
+
+/* --------------------------- status + activity --------------------------- */
+
+function setStatus(text, kind = '') {
+  $('#statusText').textContent = text;
+  $('#statusStrip').className = kind;
+}
+
+function pushActivity(line) {
+  const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  state.activity.push(stamp + '  ' + String(line).replace(/\s+$/, ''));
+  if (state.activity.length > 400) state.activity.shift();
+  const panel = $('#activityPanel');
+  if (!panel.hidden) {
+    const log = $('#activityLog');
+    const stick = panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 30;
+    log.textContent = state.activity.join('\n');
+    if (stick) panel.scrollTop = panel.scrollHeight;
+  }
 }
 
 /* ------------------------------- transcript ------------------------------ */
@@ -239,6 +380,29 @@ function transcriptEl() { return $('#transcript'); }
 function clearEmptyState() {
   const e = $('#emptyState');
   if (e) e.remove();
+}
+
+function clearTranscript() {
+  transcriptEl().textContent = '';
+  $('#approvalTray').textContent = '';
+  state.toolCards.clear();
+  state.streaming = null;
+  $('#turnStats').textContent = '';
+}
+
+// Redraw a saved conversation. Tool cards come back closed with their output
+// intact, so scrollback after a restart looks like scrollback before one.
+function restoreTranscript(session) {
+  if (!session || !session.entries || !session.entries.length) return;
+  clearEmptyState();
+  for (const e of session.entries) {
+    if (e.role === 'user') addMessage('user', e.text);
+    else if (e.role === 'assistant') { if (e.text) addMessage('assistant', e.text, { label: e.agent ? cliName(e.agent).toLowerCase() : undefined }); }
+    else if (e.role === 'tool') addToolCard({ ...e, restored: true });
+    else if (e.role === 'tool_result') finishToolCard(e);
+    else if (e.role === 'cli_tool_results') for (const r of e.results || []) finishToolCard({ id: r.id, name: 'result', output: r.output, isError: r.isError });
+  }
+  scrollDown(true);
 }
 
 function atBottom() {
@@ -328,9 +492,12 @@ function addToolCard(ev) {
   clearEmptyState();
   const stick = atBottom();
   const tagClass = 'tool-tag tag-' + (ev.risk || 'safe');
-  const output = el('div', { class: 'tool-output', text: ev.autoApproved ? 'running…' : 'waiting for approval…' });
+  const output = el('div', {
+    class: 'tool-output',
+    text: ev.restored ? '' : (ev.autoApproved ? 'running…' : 'waiting for approval…'),
+  });
   const args = el('div', { class: 'tool-args', text: JSON.stringify(ev.input || {}, null, 2) });
-  const spinner = el('span', { class: 'spinner' });
+  const spinner = ev.restored ? el('span', { class: 'dot' }) : el('span', { class: 'spinner' });
   const card = el('div', { class: 'tool-card risk-' + (ev.risk || 'safe') },
     el('div', {
       class: 'tool-head',
@@ -346,17 +513,20 @@ function addToolCard(ev) {
   transcriptEl().append(card);
   state.toolCards.set(ev.id, { card, output, spinner, ms: card.querySelector('.tool-ms') });
   scrollDown(stick);
+  if (!ev.restored) pushActivity(ev.name + ': ' + (ev.preview || ''));
 }
 
 function finishToolCard(ev) {
   const entry = state.toolCards.get(ev.id);
-  if (!entry) { addMessage('system', ev.name + ': ' + ev.output); return; }
+  if (!entry) { addMessage('system', ev.name + ': ' + (ev.output || '')); return; }
   const stick = atBottom();
   entry.output.textContent = ev.output || '(no output)';
   entry.output.classList.toggle('is-error', !!ev.isError);
-  entry.spinner.replaceWith(el('span', { class: 'dot ' + (ev.denied ? 'error' : ev.isError ? 'error' : 'ready') }));
+  if (entry.spinner && entry.spinner.isConnected) {
+    entry.spinner.replaceWith(el('span', { class: 'dot ' + (ev.denied || ev.isError ? 'error' : 'ready') }));
+  }
   if (ev.denied) entry.card.classList.add('denied');
-  if (ev.ms !== undefined) entry.ms.textContent = ev.ms >= 1000 ? (ev.ms / 1000).toFixed(1) + 's' : ev.ms + 'ms';
+  if (ev.ms !== undefined && ev.ms !== null) entry.ms.textContent = ev.ms >= 1000 ? (ev.ms / 1000).toFixed(1) + 's' : ev.ms + 'ms';
   // Errors are the output you actually need to read, so open those by default.
   if (ev.isError) entry.card.classList.add('open');
   scrollDown(stick);
@@ -370,6 +540,8 @@ function showApproval(req) {
     node.remove();
     state.approvals.delete(req.id);
     await window.deck.agent.approve({ id: req.id, decision });
+    setStatus(decision === 'deny' ? 'Denied — the model will adapt'
+      : decision === 'abort' ? 'Cancelling…' : 'Approved — working…', 'busy');
   };
   const node = el('div', { class: 'approval' + (req.risk === 'destructive' ? ' destructive' : '') },
     el('div', { class: 'approval-head' },
@@ -384,6 +556,7 @@ function showApproval(req) {
       el('button', { class: 'pill-btn danger', onclick: () => decide('abort') }, 'Cancel turn')));
   tray.append(node);
   state.approvals.set(req.id, node);
+  setStatus('Waiting for your approval — ' + req.name, 'busy');
   scrollDown(true);
 }
 
@@ -391,30 +564,40 @@ function showApproval(req) {
 
 function onEvent(ev) {
   switch (ev.type) {
+    /* live memory */
+    case 'monitor:sample': state.sample = ev.sample; renderMemory(); break;
+
     /* llama-server lifecycle */
     case 'llama:state':
       state.llama = { ...state.llama, state: ev.state, modelId: ev.modelId, port: ev.port };
-      if (ev.error) toast('llama-server: ' + ev.error, 'error');
-      if (ev.state === 'ready' && ev.loadMs) toast('Model loaded in ' + (ev.loadMs / 1000).toFixed(1) + 's.');
+      if (ev.error) { toast('llama-server: ' + ev.error, 'error'); setStatus('Model failed to load', 'error'); }
+      if (ev.state === 'loading') setStatus('Loading model into memory…', 'busy');
+      if (ev.state === 'ready') {
+        setStatus('Model ready' + (ev.loadMs ? ' (' + (ev.loadMs / 1000).toFixed(1) + 's)' : ''));
+        pushActivity('model ready on :' + ev.port);
+      }
+      if (ev.state === 'stopped') setStatus('Model unloaded');
       renderRail(); renderTopbar();
       break;
     case 'llama:log':
       state.serverLog.push(ev.line);
       if (state.serverLog.length > 500) state.serverLog.shift();
-      if ($('.deck-pane[data-pane="log"]').classList.contains('active')) renderLog();
+      if (/error|failed|cannot|unable/i.test(ev.line)) pushActivity('llama-server: ' + ev.line);
+      if (state.logView === 'llama' && $('.deck-pane[data-pane="log"]').classList.contains('active')) renderLog();
       break;
 
     /* local agent */
     case 'agent:user': break;                       // already rendered locally
-    case 'agent:thinking': setBusy(true); break;
-    case 'agent:delta': streamDelta(ev.text); break;
+    case 'agent:thinking': setBusy(true); setStatus('Thinking…', 'busy'); break;
+    case 'agent:delta': streamDelta(ev.text); setStatus('Writing…', 'busy'); break;
     case 'agent:reasoning': streamReasoning(ev.text); break;
     case 'agent:assistant': endStream(ev.text); break;
-    case 'agent:tool_call': addToolCard(ev); break;
+    case 'agent:tool_call': addToolCard(ev); setStatus('Running ' + ev.name + '…', 'busy'); break;
     case 'agent:tool_result': finishToolCard(ev); break;
-    case 'agent:trimmed': toast('Trimmed older tool output to stay inside the context window.'); break;
+    case 'agent:trimmed': pushActivity('trimmed older tool output to fit the context window'); break;
     case 'agent:done':
       setBusy(false);
+      setStatus('Done');
       $('#turnStats').textContent = [
         ev.stats.toolCalls ? ev.stats.toolCalls + ' tool calls' : null,
         ev.stats.tokensPerSec ? ev.stats.tokensPerSec + ' tok/s' : null,
@@ -422,9 +605,10 @@ function onEvent(ev) {
         ev.stats.elapsedMs ? (ev.stats.elapsedMs / 1000).toFixed(1) + 's' : null,
         ev.stats.hitTurnLimit ? 'hit turn limit' : null,
       ].filter(Boolean).join(' · ');
+      refreshSessions();
       break;
-    case 'agent:error': endStream(); setBusy(false); addMessage('error', ev.error); break;
-    case 'agent:aborted': endStream(); setBusy(false); toast('Turn cancelled.'); break;
+    case 'agent:error': endStream(); setBusy(false); addMessage('error', ev.error); setStatus(ev.error, 'error'); break;
+    case 'agent:aborted': endStream(); setBusy(false); setStatus('Cancelled'); break;
     case 'agent:reset': break;
 
     /* approvals */
@@ -433,17 +617,19 @@ function onEvent(ev) {
     /* CLI drivers */
     case 'cli:started':
       state.cliStatus[ev.agent] = { ...(state.cliStatus[ev.agent] || {}), alive: true, cwd: ev.cwd, sessionId: ev.sessionId, busy: false };
-      toast(cliName(ev.agent) + ' session started in ' + ev.cwd + (ev.note ? ' (' + ev.note + ')' : ''));
-      renderCliRail(); renderTopbar();
+      setStatus(cliName(ev.agent) + ' session started in ' + ev.cwd);
+      pushActivity(cliName(ev.agent) + ' started' + (ev.note ? ' (' + ev.note + ')' : ''));
+      renderCliRail(); renderTopbar(); refreshSessions();
       break;
     case 'cli:init':
       state.cliStatus[ev.agent] = { ...(state.cliStatus[ev.agent] || {}), alive: true, sessionId: ev.sessionId, model: ev.model };
-      toast(cliName(ev.agent) + ' ready · ' + (ev.model || 'default model') + ' · session ' + String(ev.sessionId || '').slice(0, 8));
+      setStatus(cliName(ev.agent) + ' ready · ' + (ev.model || 'default model'));
       renderCliRail(); renderTopbar();
       break;
     case 'cli:sent':
       state.cliStatus[ev.agent] = { ...(state.cliStatus[ev.agent] || {}), busy: true };
-      setBusy(true); renderCliRail(); renderTopbar();
+      setBusy(true); setStatus(cliName(ev.agent) + ' is working…', 'busy');
+      renderCliRail(); renderTopbar();
       break;
     case 'cli:delta': streamDelta(ev.text); break;
     case 'cli:reasoning': streamReasoning(ev.text); break;
@@ -460,26 +646,38 @@ function onEvent(ev) {
       endStream(ev.text);
       state.cliStatus[ev.agent] = { ...(state.cliStatus[ev.agent] || {}), busy: false, costUsd: ev.costUsd || (state.cliStatus[ev.agent] || {}).costUsd };
       setBusy(false);
+      setStatus(ev.isError ? cliName(ev.agent) + ' ended with an error' : 'Done', ev.isError ? 'error' : '');
       $('#turnStats').textContent = [
         ev.numTurns ? ev.numTurns + ' turns' : null,
         ev.durationMs ? (ev.durationMs / 1000).toFixed(1) + 's' : null,
         typeof ev.costUsd === 'number' ? '$' + ev.costUsd.toFixed(4) : null,
-        ev.isError ? 'ended with an error' : null,
       ].filter(Boolean).join(' · ');
-      renderCliRail(); renderTopbar();
+      renderCliRail(); renderTopbar(); refreshSessions();
       break;
-    case 'cli:stderr':
-      if (/\S/.test(ev.text)) addMessage('system', cliName(ev.agent) + ': ' + ev.text.trim());
-      break;
-    case 'cli:raw': addMessage('system', ev.text); break;
-    case 'cli:error': setBusy(false); addMessage('error', cliName(ev.agent) + ': ' + ev.error); break;
+    case 'cli:stderr': if (/\S/.test(ev.text)) pushActivity(cliName(ev.agent) + ': ' + ev.text.trim()); break;
+    case 'cli:raw': pushActivity(ev.text); break;
+    case 'cli:error': setBusy(false); addMessage('error', cliName(ev.agent) + ': ' + ev.error); setStatus(ev.error, 'error'); break;
     case 'cli:exit':
       state.cliStatus[ev.agent] = { alive: false, busy: false };
       setBusy(false);
-      toast(cliName(ev.agent) + ' session ended' + (ev.code ? ' (exit ' + ev.code + ')' : '') + '.');
+      setStatus(cliName(ev.agent) + ' session ended' + (ev.code ? ' (exit ' + ev.code + ')' : ''));
       renderCliRail(); renderTopbar();
       break;
     case 'cli:system': case 'cli:other': case 'cli:user_echo': break;
+
+    /* ComfyUI */
+    case 'comfy:state':
+      state.comfyStatus = { ...(state.comfyStatus || {}), state: ev.state, port: ev.port, dir: ev.dir, error: ev.error };
+      if (ev.state === 'ready') { setStatus('ComfyUI is running on :' + ev.port); pushActivity('ComfyUI ready on port ' + ev.port); }
+      if (ev.state === 'error') setStatus('ComfyUI: ' + ev.error, 'error');
+      renderComfyRail(); renderTopbar(); renderComfyView();
+      break;
+    case 'comfy:log':
+      state.comfyLog.push(ev.line);
+      if (state.comfyLog.length > 600) state.comfyLog.shift();
+      renderComfyLog();
+      if (state.logView === 'comfy' && $('.deck-pane[data-pane="log"]').classList.contains('active')) renderLog();
+      break;
 
     case 'tool:stream': break;   // live command output lands in the tool card on completion
     default: break;
@@ -491,14 +689,24 @@ function previewFor(tc) {
   return i.command || i.file_path || i.path || i.pattern || i.description || JSON.stringify(i).slice(0, 160);
 }
 
-function cliName(which) { return which === 'claude' ? 'Claude Code' : 'Copilot'; }
+function cliName(which) {
+  return which === 'claude' ? 'Claude Code' : which === 'copilot' ? 'Copilot' : 'ComfyUI';
+}
 
 function setBusy(busy) {
   state.busy = busy;
-  $('#btnSend').disabled = busy || !state.driver.kind;
+  $('#btnSend').disabled = busy || !state.driver.kind || state.driver.kind === 'comfy';
   $('#btnStop').hidden = !busy;
   $('#activeDot').className = 'dot ' + (busy ? 'busy' : state.driver.kind === 'local'
     ? (state.llama.state === 'ready' ? 'ready' : '') : ((state.cliStatus[state.driver.kind] || {}).alive ? 'ready' : ''));
+}
+
+async function refreshSessions() {
+  const r = await window.deck.sessions.list();
+  if (!r.ok) return;
+  state.sessions = r.sessions;
+  state.sessionId = r.activeId;
+  renderSessions();
 }
 
 /* --------------------------------- send --------------------------------- */
@@ -527,12 +735,14 @@ async function send() {
   addMessage('user', text);
   $('#turnStats').textContent = '';
   setBusy(true);
+  setStatus('Sending…', 'busy');
 
   const res = state.driver.kind === 'local'
     ? await window.deck.agent.send({ text })
     : await window.deck.cli.send({ agent: state.driver.kind, text });
 
-  if (!res.ok) { setBusy(false); addMessage('error', res.error); }
+  if (!res.ok) { setBusy(false); addMessage('error', res.error); setStatus(res.error, 'error'); }
+  refreshSessions();
 }
 
 async function loadActiveModel() {
@@ -549,18 +759,20 @@ async function loadActiveModel() {
     const over = (state.plan.plan.overflow / GB).toFixed(1);
     addMessage('system', 'Loading anyway: the plan is ' + over + ' GiB over the GPU budget. If it fails or crawls, apply the Deck panel’s suggestions.');
   }
-  toast('Loading ' + driverLabel() + '…');
+  setStatus('Loading ' + driverLabel() + '…', 'busy');
   const r = await window.deck.llama.swap({ id });
-  if (!r.ok) { addMessage('error', 'Could not load the model: ' + r.error); return false; }
+  if (!r.ok) { addMessage('error', 'Could not load the model: ' + r.error); setStatus(r.error, 'error'); return false; }
   state.llama = r.status;
   renderRail(); renderTopbar();
   return true;
 }
 
 async function launchCli(which) {
+  setStatus('Launching ' + cliName(which) + '…', 'busy');
   const r = await window.deck.cli.start({ agent: which, cwd: state.config.workspace });
-  if (!r.ok) { addMessage('error', r.error); return false; }
+  if (!r.ok) { addMessage('error', r.error); setStatus(r.error, 'error'); return false; }
   state.cliStatus[which] = r.status;
+  if (r.sessions) { state.sessions = r.sessions; renderSessions(); }
   renderCliRail(); renderTopbar();
   return true;
 }
@@ -568,6 +780,124 @@ async function launchCli(which) {
 function autosize(ta) {
   ta.style.height = 'auto';
   ta.style.height = Math.min(ta.scrollHeight, 220) + 'px';
+}
+
+/* ------------------------------ memory views ----------------------------- */
+
+function renderMemory() {
+  const s = state.sample;
+  if (!s) return;
+  const procBytes = Object.values(s.procs || {}).reduce((n, p) => n + (p.rssBytes || 0), 0);
+  const usedPct = (s.usedBytes / s.totalBytes) * 100;
+  const procPct = (procBytes / s.totalBytes) * 100;
+  const level = usedPct > 92 ? 'critical' : usedPct > 80 ? 'high' : '';
+
+  // rail strip
+  const bar = $('.ram-bar');
+  bar.className = 'ram-bar ' + level;
+  $('#ramFill').style.width = usedPct.toFixed(1) + '%';
+  $('#ramModel').style.width = procPct.toFixed(1) + '%';
+  $('#ramText').textContent = fmtGBshort(s.usedBytes) + ' / ' + fmtGBshort(s.totalBytes) + ' GB';
+  $('#ramModelText').textContent = procBytes ? fmtGBshort(procBytes) + ' GB loaded' : '';
+  drawSpark($('#ramSpark'), s.history, s.totalBytes, 26);
+
+  // deck system pane
+  $('#sysNums').textContent = fmtBytes(s.usedBytes) + ' / ' + fmtBytes(s.totalBytes) + '  (' + s.usedPct + '%)'
+    + (s.history.length < 6 ? '  · collecting' : '');
+  $('.gauge').className = 'gauge ' + level;
+  $('#sysFill').style.width = usedPct.toFixed(1) + '%';
+  $('#sysModelFill').style.width = procPct.toFixed(1) + '%';
+  drawSpark($('#sysSpark'), s.history, s.totalBytes, 56, {
+    marker: state.plan ? state.plan.plan.budgetBytes : null,
+    markerLabel: 'GPU budget',
+  });
+
+  const grid = $('#procGrid');
+  grid.textContent = '';
+  const rows = [
+    ['Free', fmtBytes(s.freeBytes)],
+    ...Object.entries(s.procs || {}).map(([name, p]) => [name + ' (pid ' + p.pid + ')', fmtBytes(p.rssBytes)]),
+  ];
+  if (rows.length === 1) rows.push(['Deck processes', 'none running']);
+  for (const [k, v] of rows) grid.append(el('dt', {}, k), el('dd', {}, v));
+
+  const gpuBlock = $('#gpuBlock');
+  gpuBlock.textContent = '';
+  if (s.gpu) {
+    const pct = (s.gpu.usedBytes / s.gpu.totalBytes) * 100;
+    const fill = el('div', { class: 'gauge-fill' });
+    fill.style.width = pct.toFixed(1) + '%';
+    gpuBlock.append(el('div', { class: 'gpu-block' },
+      el('div', {}, 'Dedicated VRAM (' + s.gpu.source + ')'),
+      el('div', { class: 'gauge' }, fill),
+      el('div', { class: 'deck-note' }, fmtBytes(s.gpu.usedBytes) + ' / ' + fmtBytes(s.gpu.totalBytes))));
+  }
+
+  $('#sysNote').textContent = state.hw && state.hw.unified
+    ? 'This machine shares one memory pool between CPU and GPU, so the bar above is the real constraint: whatever a model holds is RAM Windows cannot use. Unload between models rather than hoping the driver reclaims it.'
+    : 'System RAM. Dedicated VRAM is reported separately when a vendor tool is available.';
+}
+
+// A thin filled area chart. No library: it is two fills and a line, and drawing
+// it by hand keeps the app dependency-free.
+function drawSpark(canvas, history, total, height, opts = {}) {
+  if (!canvas || !history || history.length < 2) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || canvas.width;
+  if (canvas.width !== Math.floor(w * dpr) || canvas.height !== Math.floor(height * dpr)) {
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(height * dpr);
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.save();
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, height);
+
+  const pts = history.slice(-90);
+  const x = (i) => (i / Math.max(1, pts.length - 1)) * w;
+  const y = (v) => height - (v / total) * height;
+
+  ctx.beginPath();
+  ctx.moveTo(0, height);
+  pts.forEach((p, i) => ctx.lineTo(x(i), y(p.usedBytes)));
+  ctx.lineTo(w, height);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(59, 74, 99, 0.55)';
+  ctx.fill();
+
+  // the share held by the deck's own processes
+  ctx.beginPath();
+  ctx.moveTo(0, height);
+  pts.forEach((p, i) => ctx.lineTo(x(i), y(p.modelBytes || 0)));
+  ctx.lineTo(w, height);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(29, 127, 120, 0.75)';
+  ctx.fill();
+
+  ctx.beginPath();
+  pts.forEach((p, i) => (i ? ctx.lineTo(x(i), y(p.usedBytes)) : ctx.moveTo(x(i), y(p.usedBytes))));
+  ctx.strokeStyle = '#8fa2bd';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Where the GPU budget sits on the same axis, so "will it fit" and "what is
+  // in use right now" can be read against each other.
+  if (opts.marker && opts.marker < total) {
+    const my = y(opts.marker);
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(0, my);
+    ctx.lineTo(w, my);
+    ctx.strokeStyle = 'rgba(139, 127, 245, 0.8)';
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (opts.markerLabel && my > 10) {
+      ctx.fillStyle = 'rgba(139, 127, 245, 0.9)';
+      ctx.font = '9px ui-monospace, monospace';
+      ctx.fillText(opts.markerLabel, 2, my - 3);
+    }
+  }
+  ctx.restore();
 }
 
 /* ------------------------------- deck panel ------------------------------ */
@@ -584,6 +914,7 @@ async function refreshPlan(modelId, overrides) {
 function renderDeck() {
   renderBudget();
   renderLog();
+  renderMemory();
 }
 
 function renderBudget() {
@@ -656,8 +987,11 @@ function renderBudget() {
 
 function renderLog() {
   const pre = $('#serverLog');
+  const lines = state.logView === 'comfy' ? state.comfyLog : state.serverLog;
   const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 40;
-  pre.textContent = state.serverLog.length ? state.serverLog.join('\n') : 'No llama-server output yet.';
+  pre.textContent = lines.length
+    ? lines.join('\n')
+    : (state.logView === 'comfy' ? 'ComfyUI has not been started from the deck yet.' : 'No llama-server output yet.');
   if (stick) pre.scrollTop = pre.scrollHeight;
 }
 
@@ -729,8 +1063,7 @@ function renderProfileForm() {
         else if (value) onChange(f.key, null);
       });
     }
-    const row = el('label', { class: 'field row', title: f.hint || '' }, el('span', {}, f.label), control);
-    host.append(row);
+    host.append(el('label', { class: 'field row', title: f.hint || '' }, el('span', {}, f.label), control));
   }
 
   host.append(el('h4', {}, 'Command line'));
@@ -744,6 +1077,87 @@ function renderProfileForm() {
     el('button', { class: 'pill-btn', onclick: async () => { await window.deck.llama.stop(); } }, 'Unload')));
   host.append(el('p', { class: 'deck-note' },
     'Changes save as you make them and take effect on the next load. Anything the deck does not expose can go in extraArgs in config.json.'));
+}
+
+/* ------------------------------- ComfyUI view ---------------------------- */
+
+function renderComfyView() {
+  const info = state.comfy || {};
+  const st = state.comfyStatus || {};
+  const stateEl = $('#comfyState');
+  const running = st.state === 'ready';
+  const working = st.state === 'starting' || st.state === 'installing';
+
+  stateEl.textContent = running ? 'running on port ' + st.port
+    : st.state === 'installing' ? 'installing…'
+      : st.state === 'starting' ? 'starting…'
+        : st.state === 'error' ? 'error'
+          : info.installed ? 'installed, not running' : 'not installed';
+  stateEl.className = 'comfy-state ' + (running ? 'ready' : st.state === 'error' ? 'error' : working ? 'working' : '');
+
+  $('#comfyBlurb').textContent = info.installed
+    ? 'Image generation, running locally. The deck starts and stops the server and keeps its memory use on the same gauge as everything else; the interface itself opens in a browser or in a deck window.'
+    : 'ComfyUI is the node-based image generator. The deck can set it up for you: it clones the repo, builds a private Python environment beside it, and installs a torch build that matches this machine. Nothing is installed system-wide.';
+
+  $('#comfyPathRow').hidden = !info.installed;
+  $('#btnComfyDir').textContent = info.dir ? shortPath(info.dir, 40) : 'choose…';
+  $('#btnComfyDir').title = info.dir || '';
+  $('#comfyPort').value = (state.config.comfy && state.config.comfy.port) || st.port || 8188;
+
+  $('#btnComfyStart').hidden = !info.installed || running || working;
+  $('#btnComfyOpen').hidden = !running;
+  $('#btnComfyOpenApp').hidden = !running;
+  $('#btnComfyStop').hidden = !running && !working;
+
+  const install = $('#comfyInstall');
+  install.hidden = !!info.installed;
+  if (!info.installed) {
+    $('#btnComfyInstallDir').textContent = shortPath(state.pendingComfyDir || info.suggestedDir || '', 40);
+    const sel = $('#comfyFlavor');
+    if (!sel.options.length) {
+      for (const [key, f] of Object.entries(state.comfyFlavors)) {
+        sel.append(el('option', { value: key, selected: key === (state.config.comfy && state.config.comfy.flavor) }, f.label));
+      }
+    }
+    const f = state.comfyFlavors[sel.value];
+    const missing = [];
+    if (info.git === false) missing.push('git is not installed');
+    if (!info.systemPython) missing.push('Python is not installed');
+    $('#comfyFlavorNote').textContent = missing.length
+      ? missing.join(' · ') + ' — install those first, then come back.'
+      : (f ? f.note : '');
+    $('#btnComfyInstall').disabled = missing.length > 0 || working;
+  }
+
+  const stats = $('#comfyStats');
+  if (running && st.stats) {
+    const dev = (st.stats.devices || [])[0];
+    stats.hidden = false;
+    stats.textContent = dev
+      ? dev.name + ' — VRAM ' + fmtBytes(dev.vram_total - dev.vram_free) + ' used of ' + fmtBytes(dev.vram_total)
+      : JSON.stringify(st.stats.system || {});
+  } else stats.hidden = true;
+
+  renderComfyLog();
+}
+
+function renderComfyLog() {
+  const pre = $('#comfyLog');
+  if (!pre) return;
+  const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 40;
+  pre.textContent = state.comfyLog.length ? state.comfyLog.slice(-300).join('\n') : '';
+  pre.hidden = !state.comfyLog.length;
+  if (stick) pre.scrollTop = pre.scrollHeight;
+}
+
+async function refreshComfy() {
+  const r = await window.deck.comfy.detect();
+  if (!r.ok) return;
+  state.comfy = r.comfy;
+  state.comfyStatus = r.status;
+  state.comfyFlavors = r.flavors || state.comfyFlavors;
+  renderComfyRail();
+  if (state.driver.kind === 'comfy') renderComfyView();
 }
 
 /* -------------------------------- settings ------------------------------- */
@@ -800,23 +1214,21 @@ function wireChrome() {
 
   $('#btnStop').addEventListener('click', async () => {
     if (state.driver.kind === 'local') await window.deck.agent.abort();
-    else await window.deck.cli.interrupt({ agent: state.driver.kind });
+    else if (state.driver.kind) await window.deck.cli.interrupt({ agent: state.driver.kind });
     setBusy(false);
+    setStatus('Stopped');
   });
 
-  $('#btnNewChat').addEventListener('click', async () => {
-    transcriptEl().textContent = '';
-    $('#approvalTray').textContent = '';
-    state.toolCards.clear();
-    state.streaming = null;
-    $('#turnStats').textContent = '';
-    if (state.driver.kind === 'local') await window.deck.agent.reset();
-    else if (state.driver.kind) {
-      await window.deck.cli.stop({ agent: state.driver.kind });
-      state.cliStatus[state.driver.kind] = { alive: false, busy: false };
-      renderCliRail(); renderTopbar();
+  $('#btnNewChat').addEventListener('click', () => startNewSession());
+  $('#btnNewSession').addEventListener('click', () => startNewSession());
+
+  $('#btnActivity').addEventListener('click', () => {
+    const panel = $('#activityPanel');
+    panel.hidden = !panel.hidden;
+    if (!panel.hidden) {
+      $('#activityLog').textContent = state.activity.join('\n') || 'Nothing yet.';
+      panel.scrollTop = panel.scrollHeight;
     }
-    toast('New chat. The workspace and driver are unchanged.');
   });
 
   $('#btnLaunch').addEventListener('click', async () => {
@@ -827,7 +1239,7 @@ function wireChrome() {
   $('#btnUnload').addEventListener('click', async () => {
     if (state.driver.kind === 'local') {
       await window.deck.llama.stop();
-      toast('Model unloaded; the memory is back.');
+      setStatus('Model unloaded — the memory is back');
     } else if (state.driver.kind) {
       await window.deck.cli.stop({ agent: state.driver.kind });
       state.cliStatus[state.driver.kind] = { alive: false, busy: false };
@@ -843,8 +1255,7 @@ function wireChrome() {
       resumeId: state.driver.kind === 'claude' ? sess.sessionId : null,
     });
     if (!r.ok) toast('Could not open a terminal: ' + r.error, 'error');
-    else toast('Opened ' + cliName(state.driver.kind) + ' in a terminal (' + r.via + ')'
-      + (r.via && state.driver.kind === 'claude' && sess.sessionId ? ', resuming this session' : '') + '.');
+    else setStatus('Opened ' + cliName(state.driver.kind) + ' in a terminal (' + r.via + ')');
   });
 
   $('#btnWorkspace').addEventListener('click', async () => {
@@ -872,6 +1283,13 @@ function wireChrome() {
     $$('.deck-pane').forEach((p) => p.classList.toggle('active', p.dataset.pane === tab.dataset.tab));
     if (tab.dataset.tab === 'log') renderLog();
     if (tab.dataset.tab === 'profile') renderProfileForm();
+    if (tab.dataset.tab === 'system') renderMemory();
+  }));
+
+  $$('.log-switch .chip').forEach((chip) => chip.addEventListener('click', () => {
+    state.logView = chip.dataset.log;
+    $$('.log-switch .chip').forEach((c) => c.classList.toggle('active', c === chip));
+    renderLog();
   }));
 
   /* settings fields */
@@ -905,6 +1323,46 @@ function wireChrome() {
   $('#sampMax').addEventListener('change', (e) => patchConfig({ sampling: { max_tokens: Number(e.target.value) } }));
   $('#btnRevealConfig').addEventListener('click', () => window.deck.config.reveal());
 
+  /* ComfyUI */
+  $('#btnComfyStart').addEventListener('click', async () => {
+    setStatus('Starting ComfyUI…', 'busy');
+    const r = await window.deck.comfy.start({ port: Number($('#comfyPort').value) || 8188 });
+    if (!r.ok) { setStatus('ComfyUI: ' + r.error, 'error'); pushActivity('ComfyUI failed to start: ' + r.error); }
+    else { state.comfyStatus = r.status; renderComfyRail(); renderComfyView(); }
+  });
+  $('#btnComfyStop').addEventListener('click', async () => {
+    const r = await window.deck.comfy.stop();
+    state.comfyStatus = r.status;
+    renderComfyRail(); renderComfyView(); setStatus('ComfyUI stopped');
+  });
+  $('#btnComfyOpen').addEventListener('click', () => window.deck.comfy.open({ inApp: false }));
+  $('#btnComfyOpenApp').addEventListener('click', () => window.deck.comfy.open({ inApp: true }));
+  $('#btnComfyDir').addEventListener('click', async () => {
+    const r = await window.deck.comfy.pickDir();
+    if (!r.ok && r.error) toast(r.error, 'error');
+    await refreshComfy();
+  });
+  $('#btnComfyInstallDir').addEventListener('click', async () => {
+    const r = await window.deck.pick.directory({ title: 'Where should ComfyUI be installed?' });
+    if (!r.ok) return;
+    const base = r.path.replace(/[\\/]+$/, '');
+    state.pendingComfyDir = /comfyui$/i.test(base) ? base : base + (state.platform === 'win32' ? '\\ComfyUI' : '/ComfyUI');
+    renderComfyView();
+  });
+  $('#comfyFlavor').addEventListener('change', () => renderComfyView());
+  $('#btnComfyInstall').addEventListener('click', async () => {
+    const dir = state.pendingComfyDir || (state.comfy && state.comfy.suggestedDir);
+    const flavor = $('#comfyFlavor').value;
+    $('#btnComfyInstall').disabled = true;
+    setStatus('Installing ComfyUI — this takes a few minutes', 'busy');
+    const r = await window.deck.comfy.install({ dir, flavor });
+    $('#btnComfyInstall').disabled = false;
+    if (!r.ok) { setStatus('Install failed: ' + r.error, 'error'); return; }
+    await patchConfig({ comfy: { dir: r.dir, python: r.python, flavor } });
+    await refreshComfy();
+    setStatus('ComfyUI installed — press Start');
+  });
+
   /* model library */
   $('#btnAddModel').addEventListener('click', async () => {
     const r = await window.deck.pick.file({ title: 'Choose a GGUF model', filters: [{ name: 'GGUF', extensions: ['gguf'] }] });
@@ -914,7 +1372,7 @@ function wireChrome() {
     state.config = add.config;
     renderRail();
     selectDriver({ kind: 'local', modelId: add.model.id });
-    toast('Added ' + add.model.name + '.');
+    setStatus('Added ' + add.model.name);
   });
 
   $('#btnScanModels').addEventListener('click', async () => {
@@ -929,6 +1387,18 @@ function wireChrome() {
   $('#scanModal').addEventListener('click', (e) => { if (e.target.id === 'scanModal') $('#scanModal').hidden = true; });
 
   setInterval(refreshCliStatus, 5000);
+  setInterval(() => { if (state.sessions.length) renderSessions(); }, 60000);  // keep "3m ago" honest
+  window.addEventListener('resize', () => renderMemory());
+}
+
+async function startNewSession() {
+  const r = await window.deck.sessions.create({ driver: state.driver });
+  if (!r.ok) { toast(r.error, 'error'); return; }
+  state.sessionId = r.session.id;
+  state.sessions = r.sessions;
+  clearTranscript();
+  renderSessions();
+  setStatus('New session. The workspace and driver are unchanged.');
 }
 
 async function refreshCli() {

@@ -1,18 +1,25 @@
 # Laguna Deck
 
 A Windows control deck for local models and coding agents. One window, one
-workspace, one set of approval rules — and three interchangeable drivers:
+workspace, one set of approval rules — and four interchangeable drivers:
 
 | Driver | What it is | How it runs |
 |---|---|---|
 | **Local model** | Any GGUF through `llama-server`, with an agent loop and real tools | Spawned and supervised by the deck |
 | **Claude Code** | The `claude` CLI, with its own tools and permissions | Launched as a live session inside the deck |
 | **GitHub Copilot** | The `copilot` CLI | Launched per turn, context carried with `--continue` |
+| **ComfyUI** | Local image generation | Installed, started and stopped by the deck; opens in a browser or a deck window |
 
 Built for a unified-memory mini PC (Ryzen AI Max class, where system RAM *is*
 graphics memory), so the hard part isn't the chat — it's knowing whether a model
 plus its KV cache fits the graphics carve-out, and what to move when it doesn't.
-That's what the Deck panel is for.
+That's what the Deck panel is for, and why a live memory gauge sits in the
+corner of every screen.
+
+Every conversation is saved. Sessions appear in the sidebar with their titles
+and message counts, switching between them restores both the transcript *and*
+the model's memory of it, and closing the app is not the same as losing your
+work.
 
 Primary driver is **Laguna XS**; anything else GGUF works the same way.
 
@@ -67,7 +74,21 @@ Spilling past the carve-out into shared memory doesn't fail — it just collapse
 throughput, which is much harder to diagnose than an out-of-memory error. The
 deck warns you before loading something that won't fit.
 
-### 3. The CLI agents (optional, per driver)
+### 3. ComfyUI (optional)
+
+Select **ComfyUI** in the sidebar. If it's already on the machine the deck finds
+it and just needs a Start; if it isn't, the panel offers to set it up: it clones
+the repo, builds a private Python environment beside it, and installs the torch
+build you choose. On an AMD Windows box that's **DirectML**, which works on any
+DirectX 12 GPU including the iGPU. Nothing is installed system-wide, and the
+whole install streams into the log so a failure at step four is something you
+can finish by hand.
+
+Once it's running, its memory shows up on the same gauge as everything else, and
+**Open in a deck window** puts the interface in its own window instead of a
+browser tab.
+
+### 4. The CLI agents (optional, per driver)
 
 - **Claude Code** — install it and run `claude` once to sign in. The deck finds
   it on `PATH`, or you can point Settings at the binary.
@@ -96,6 +117,22 @@ tell at a glance which ones are ready.
 Switching driver is one click in the sidebar. Loading a different local model
 unloads the current one first — on a unified box, two resident models would just
 evict each other.
+
+### Sessions
+
+The sidebar keeps every conversation: title, message count, how long ago. Click
+one to switch to it — the transcript redraws, tool cards and all, and the model
+gets its own history back so it remembers what you're both looking at. **New
+session** starts a clean one without changing the workspace or the driver.
+Deleting is immediate and permanent.
+
+### Status and activity
+
+The strip under the title bar is the one line of truth about what's happening:
+loading, thinking, running a tool, waiting on your approval, done. **activity**
+expands a timestamped feed of everything underneath that — tool calls,
+llama-server errors, CLI output, ComfyUI startup — which is where to look when
+the status line says something you didn't expect.
 
 ### Launching the CLI agents
 
@@ -134,6 +171,13 @@ shell operators: `git log | rm -rf x` is classified by the `rm`, not the `git`.
 
 ## The Deck panel
 
+**System** — live memory, sampled every two seconds. A gauge of system RAM with
+the share held by the deck's own processes (llama-server, ComfyUI, the CLI
+agents) called out separately, a three-minute history chart with the GPU budget
+marked on it, and per-process numbers. On a unified-memory box this is the
+honest picture: whatever a model holds is RAM Windows cannot have. Dedicated
+VRAM appears too when `nvidia-smi` or `rocm-smi` can report it.
+
 **Budget** — a stacked meter of weights / KV cache / compute buffers against your
 GPU budget, with the numbers behind it:
 
@@ -150,8 +194,8 @@ flash attention, `-ngl`, `--n-cpu-moe`, batch and micro-batch sizes, threads,
 shows the exact `llama-server` command line it will run, so nothing is hidden.
 Changes save as you type and apply on the next load.
 
-**Server log** — `llama-server`'s own output. First place to look when a load
-fails.
+**Log** — `llama-server`'s own output, with a second tab for ComfyUI. First place
+to look when either fails to start.
 
 ### Things worth knowing
 
@@ -195,6 +239,11 @@ permission mode. Run `claude auth status` in a terminal, and remember that in
 **Copilot says it isn't signed in** — run `copilot` once in a terminal to log
 in, or set `COPILOT_GITHUB_TOKEN`.
 
+**ComfyUI won't install** — the panel refuses to start unless git and Python are
+both on PATH, and says which one is missing. Install those first. If the torch
+step fails, the log has the exact `pip` command that failed, which you can run
+yourself in `ComfyUI/.venv`.
+
 **Bandwidth shows "unknown"** — the deck only derives bandwidth for CPUs it
 recognises. Everything still works; the throughput estimate is just omitted
 rather than guessed.
@@ -210,6 +259,9 @@ electron/
   selftest.js          headless test suite: npm run selftest
   lib/
     config.js          one JSON file in userData, written atomically
+    sessions.js        persisted conversations: transcript + model-facing history
+    monitor.js         live RAM / process / VRAM sampling with a short history
+    comfy.js           ComfyUI detect, install, supervise, /system_stats
     hardware.js        RAM / GPU / DIMM probe, memory-bandwidth derivation
     gguf.js            GGUF header reader (metadata only, never the weights)
     planner.js         KV-cache maths, fit analysis, offload advice, argv builder
@@ -224,12 +276,17 @@ renderer/
   styles.css           one stylesheet, no frameworks
 ```
 
-`npm run selftest` runs headless on any platform: it builds a synthetic MoE
-GGUF and reads it back, checks the offload maths end to end, exercises the tool
-sandbox (including path escapes and destructive-command classification), and
-runs the real agent loop against a mock OpenAI-compatible server that emits a
-tool call — so the stream parser, tool dispatch, and approval gate are covered
-without a GPU.
+Two test commands, both headless, both in CI:
+
+- `npm run selftest` (38 checks) builds a synthetic MoE GGUF and reads it back,
+  checks the offload maths end to end, exercises the tool sandbox (path escapes
+  and destructive-command classification included), runs the real agent loop
+  against a mock OpenAI-compatible server that emits a tool call, and covers
+  session persistence and ComfyUI detection — no GPU, no model, no Windows.
+- `npm run smoke` boots the actual Electron window under Xvfb, drives it
+  (add a model, start a session, switch drivers, open each panel) and asserts
+  the renderer came up clean. It has already caught a CSP violation and an
+  un-rendered topbar that the node-only tests could not see.
 
 ## Known limits
 
@@ -243,7 +300,9 @@ without a GPU.
   you want the real TUI.
 - **Copilot turns are one process each** — that's its `-p` design, not a
   shortcut here.
-- **Windows-first.** The code runs on Linux (that's where the self-test runs) but
-  the hardware probe, the installer, and the tuning advice target Windows.
+- **Windows-first.** The code runs on Linux (that's where the tests run) but the
+  hardware probe, the installer, and the tuning advice target Windows.
+- **ComfyUI is launched, not embedded.** The deck manages the process and the
+  environment; the node editor is ComfyUI's own interface.
 
 MIT.

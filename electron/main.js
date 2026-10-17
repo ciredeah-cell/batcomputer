@@ -12,8 +12,23 @@ const { LlamaServer, findLlamaServer } = require('./lib/llama');
 const tools = require('./lib/tools');
 const { LocalAgent } = require('./lib/agent');
 const cli = require('./lib/cli-agent');
+const { SessionStore } = require('./lib/sessions');
+const { Monitor } = require('./lib/monitor');
+const comfy = require('./lib/comfy');
 
 const isDev = process.argv.includes('--dev');
+const isSmoke = process.env.LAGUNA_SMOKE === '1';
+
+// The smoke check runs against a throwaway profile: it must never read or
+// write the real one, and it has to start from the same blank state every time
+// or its assertions drift with whatever the last run left behind.
+if (isSmoke) {
+  const smokeDir = path.join(require('os').tmpdir(), 'laguna-deck-smoke-' + process.pid);
+  fs.rmSync(smokeDir, { recursive: true, force: true });
+  fs.mkdirSync(smokeDir, { recursive: true });
+  app.setPath('userData', smokeDir);
+  app.on('quit', () => { try { fs.rmSync(smokeDir, { recursive: true, force: true }); } catch (_) { /* temp dir */ } });
+}
 
 let win = null;
 let tray = null;
@@ -22,13 +37,56 @@ let hw = null;
 let llama = null;
 let agent = null;
 let toolCtx = null;
+let sessions = null;
+let monitor = null;
+let comfyServer = null;
+let currentSessionId = null;
 const cliSessions = new Map();          // 'claude' | 'copilot' -> session
 const pendingApprovals = new Map();     // id -> resolve
 
 /* ------------------------------- plumbing -------------------------------- */
 
 function emit(event) {
+  recordEvent(event);
   if (win && !win.isDestroyed()) win.webContents.send('deck:event', event);
+}
+
+// Everything the user sees in the transcript is also written to the active
+// session, so closing the app is not the same as losing the conversation.
+const RECORDERS = {
+  'agent:user': (e) => ({ role: 'user', text: e.text }),
+  'agent:assistant': (e) => (e.text || (e.toolCalls || []).length
+    ? { role: 'assistant', text: e.text, reasoning: e.reasoning || '', toolCalls: e.toolCalls || [] } : null),
+  'agent:tool_call': (e) => ({ role: 'tool', id: e.id, name: e.name, input: e.input, preview: e.preview, risk: e.risk, why: e.why, autoApproved: e.autoApproved }),
+  'agent:tool_result': (e) => ({ role: 'tool_result', id: e.id, name: e.name, output: e.output, isError: e.isError, denied: e.denied, ms: e.ms }),
+  'cli:sent': (e) => ({ role: 'user', text: e.text }),
+  'cli:assistant': (e) => (e.text || (e.toolCalls || []).length
+    ? { role: 'assistant', text: e.text, toolCalls: e.toolCalls || [], agent: e.agent } : null),
+  'cli:tool_results': (e) => ({ role: 'cli_tool_results', results: e.results }),
+  'cli:result': (e) => (e.text ? { role: 'assistant', text: e.text, agent: e.agent, final: true } : null),
+};
+
+function recordEvent(event) {
+  if (!sessions || !currentSessionId) return;
+  const make = RECORDERS[event.type];
+  if (!make) return;
+  try {
+    const entry = make(event);
+    if (entry) sessions.append(currentSessionId, entry);
+  } catch (_) { /* recording must never break the stream */ }
+}
+
+function persistAgentHistory() {
+  if (!sessions || !currentSessionId || !agent) return;
+  sessions.setAgentMessages(currentSessionId, agent.messages);
+}
+
+function ensureSession(driver) {
+  if (currentSessionId && sessions.load(currentSessionId)) return sessions.load(currentSessionId);
+  const s = sessions.create({ driver: driver || { kind: null, modelId: null } });
+  currentSessionId = s.id;
+  config.patch({ activeSessionId: s.id });
+  return s;
 }
 
 function buildToolCtx() {
@@ -193,10 +251,13 @@ async function runSmoke() {
     modelRows: document.querySelectorAll('#modelList li').length,
     cliRows: document.querySelectorAll('#cliList .driver').length,
     claudeMeta: document.querySelector('#metaClaude').textContent,
+    comfyMeta: document.querySelector('#metaComfy').textContent,
     activeName: document.querySelector('#activeName').textContent,
     budget: document.querySelector('#budgetNums').textContent,
     sendDisabled: document.querySelector('#btnSend').disabled,
     tabs: document.querySelectorAll('.deck-tabs .tab').length,
+    status: document.querySelector('#statusText').textContent,
+    sessionRows: document.querySelectorAll('#sessionList li').length,
   }))()`).catch((err) => ({ error: err.message }));
 
   // Second phase: put a real (fixture) model through the library, then select
@@ -214,9 +275,33 @@ async function runSmoke() {
     const row = document.querySelector('#modelList li.driver');
     if (row) row.click();
     await new Promise((r) => setTimeout(r, 900));
+    // Start a session, then look at the ComfyUI driver, then come back to the
+    // offload tab -- the three views a user actually moves between.
+    document.querySelector('#btnNewSession').click();
+    await new Promise((r) => setTimeout(r, 700));
+    const sessionsAfterNew = document.querySelectorAll('#sessionList li.session').length;
+    document.querySelector('#comfyRow').click();
+    await new Promise((r) => setTimeout(r, 500));
+    const comfyShown = !document.querySelector('#comfyView').hidden && document.querySelector('#transcript').hidden;
+    const comfyText = document.querySelector('#comfyView').textContent;
+    if (row) row.click();
+    await new Promise((r) => setTimeout(r, 400));
     document.querySelector('.deck-tabs .tab[data-tab="profile"]').click();
     await new Promise((r) => setTimeout(r, 400));
     return {
+      sessionsAfterNew,
+      comfyShown,
+      comfyText,
+      ramText: document.querySelector('#ramText').textContent,
+      sysNums: document.querySelector('#sysNums').textContent,
+      sparkPainted: (() => {
+        const c = document.querySelector('#sysSpark');
+        try {
+          const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+          for (let i = 3; i < d.length; i += 4) if (d[i] !== 0) return true;
+        } catch (_) { return false; }
+        return false;
+      })(),
       rowRendered: !!row,
       rowText: row ? row.textContent : '',
       budget: document.querySelector('#budgetNums').textContent,
@@ -235,7 +320,10 @@ async function runSmoke() {
     ['hardware line rendered', !!probe.hwLine && probe.hwLine !== 'probing hardware…'],
     ['both CLI driver rows rendered', probe.cliRows === 2],
     ['CLI detection ran', probe.claudeMeta !== 'checking…'],
-    ['deck tabs rendered', probe.tabs === 3],
+    ['deck tabs rendered', probe.tabs === 4],
+    ['ComfyUI detection ran', probe.comfyMeta !== 'checking…'],
+    ['status strip reports state', !!probe.status && probe.status !== 'Idle' ? true : probe.status === 'Idle'],
+    ['session rail rendered', probe.sessionRows >= 1],
     ['no driver selected on a clean profile', probe.sendDisabled === true],
     ['added model appears in the rail', deep.rowRendered === true],
     ['model row shows its MoE routing', /MoE 8\/64/.test(deep.rowText || '')],
@@ -244,6 +332,12 @@ async function runSmoke() {
     ['offload form rendered', (deep.profileFields || 0) >= 12],
     ['command preview includes the model', /--jinja/.test(deep.cmdline || '')],
     ['selecting a model enables the composer', deep.sendDisabled === false],
+    ['new session appears in the rail', (deep.sessionsAfterNew || 0) >= 1],
+    ['ComfyUI driver swaps in its own view', deep.comfyShown === true],
+    ['ComfyUI panel offers setup or start', /Install ComfyUI|Start ComfyUI/.test(deep.comfyText || '')],
+    ['live RAM gauge has numbers',
+      /[\d.]+ \/ [\d.]+ GB/.test(deep.ramText || '') && /GiB \/ .*GiB/.test(deep.sysNums || '')],
+    ['memory history chart is drawn', deep.sparkPainted === true],
     ['no renderer errors', errors.length === 0],
   ];
   const failed = checks.filter(([, ok]) => !ok);
@@ -264,9 +358,11 @@ async function runSmoke() {
         console.log('  screenshot: ' + file);
       };
       await shot('-offload');
-      await wc.executeJavaScript('document.querySelector(\'.deck-tabs .tab[data-tab="budget"]\').click()');
-      await new Promise((r) => setTimeout(r, 500));
-      await shot('-budget');
+      for (const tab of ['budget', 'system']) {
+        await wc.executeJavaScript('document.querySelector(\'.deck-tabs .tab[data-tab="' + tab + '"]\').click()');
+        await new Promise((r) => setTimeout(r, 600));
+        await shot('-' + tab);
+      }
     } catch (err) { console.log('  screenshot failed: ' + err.message); }
   }
   for (const e of errors) console.log('  console: ' + e);
@@ -322,6 +418,11 @@ function wireIpc() {
       hw,
       llama: llama.status(),
       cli: await cli.detect(config.get().cli),
+      comfy: comfy.detect(config.get().comfy && config.get().comfy.dir),
+      comfyStatus: comfyServer.status(),
+      comfyFlavors: comfy.TORCH_FLAVORS,
+      sessions: sessions.list(),
+      session: currentSessionId ? sessions.load(currentSessionId) : null,
       platform: process.platform,
       appVersion: app.getVersion(),
       tools: Object.entries(tools.TOOLS).map(([name, t]) => ({ name, risk: t.risk, description: t.description })),
@@ -443,6 +544,7 @@ function wireIpc() {
   handle('agent:send', async ({ text, enabledTools }) => {
     const cfg = config.get();
     const model = cfg.activeModelId ? config.model(cfg.activeModelId) : null;
+    ensureSession({ kind: 'local', modelId: cfg.activeModelId });
     buildToolCtx();
     const res = await agent.send({
       text,
@@ -452,7 +554,8 @@ function wireIpc() {
       approvalMode: cfg.approvalMode,
       enabledTools: enabledTools && enabledTools.length ? enabledTools : undefined,
     });
-    return { ok: true, ...res };
+    persistAgentHistory();
+    return { ok: true, ...res, sessions: sessions.list() };
   });
 
   handle('agent:abort', async () => {
@@ -464,6 +567,126 @@ function wireIpc() {
   handle('agent:reset', async () => { agent.reset(); return { ok: true }; });
   handle('agent:transcript', async () => ({ ok: true, messages: agent.transcript() }));
   handle('agent:approve', async ({ id, decision }) => resolveApproval(id, decision));
+
+  /* ----- sessions ----- */
+
+  handle('sessions:list', async () => ({ ok: true, sessions: sessions.list(), activeId: currentSessionId }));
+
+  handle('sessions:new', async ({ driver }) => {
+    if (currentSessionId) persistAgentHistory();
+    const s = sessions.create({ driver });
+    currentSessionId = s.id;
+    config.patch({ activeSessionId: s.id });
+    agent.reset();
+    return { ok: true, session: s, sessions: sessions.list() };
+  });
+
+  handle('sessions:switch', async ({ id }) => {
+    const s = sessions.load(id);
+    if (!s) return { ok: false, error: 'no such session' };
+    if (currentSessionId) persistAgentHistory();
+    currentSessionId = id;
+    config.patch({ activeSessionId: id });
+    // Restore the model-facing history too, so the model remembers what the
+    // transcript shows rather than just appearing to.
+    agent.reset();
+    agent.messages = Array.isArray(s.agent) ? s.agent.slice() : [];
+    agent.systemText = agent.messages.length && agent.messages[0].role === 'system' ? agent.messages[0].content : null;
+    return { ok: true, session: s, sessions: sessions.list() };
+  });
+
+  handle('sessions:delete', async ({ id }) => {
+    sessions.remove(id);
+    if (currentSessionId === id) {
+      currentSessionId = null;
+      config.patch({ activeSessionId: null });
+      agent.reset();
+    }
+    return { ok: true, sessions: sessions.list(), activeId: currentSessionId };
+  });
+
+  handle('sessions:rename', async ({ id, title }) => {
+    const s = sessions.patch(id, { title: String(title || '').slice(0, 120) || 'Untitled' });
+    return s ? { ok: true, session: s, sessions: sessions.list() } : { ok: false, error: 'no such session' };
+  });
+
+  handle('sessions:get', async ({ id }) => {
+    const s = sessions.load(id || currentSessionId);
+    return s ? { ok: true, session: s } : { ok: false, error: 'no such session' };
+  });
+
+  /* ----- memory monitor ----- */
+
+  handle('monitor:sample', async () => ({ ok: true, sample: await monitor.sample() }));
+
+  /* ----- ComfyUI ----- */
+
+  handle('comfy:detect', async () => {
+    const cfg = config.get();
+    return { ok: true, comfy: comfy.detect(cfg.comfy && cfg.comfy.dir), status: comfyServer.status(), flavors: comfy.TORCH_FLAVORS };
+  });
+
+  handle('comfy:install', async ({ dir, flavor }) => {
+    const target = dir || comfy.detect().suggestedDir;
+    comfyServer.setState('installing', { dir: target });
+    emit({ type: 'comfy:log', line: 'Installing ComfyUI into ' + target + ' (' + flavor + ')' });
+    try {
+      const r = await comfy.install({ dir: target, flavor, onLog: (line) => emit({ type: 'comfy:log', line }) });
+      config.patch({ comfy: { dir: target, python: r.python, flavor } });
+      comfyServer.setState('stopped');
+      return { ok: true, ...r, comfy: comfy.detect(target) };
+    } catch (err) {
+      comfyServer.setState('error', { error: err.message });
+      return { ok: false, error: err.message };
+    }
+  });
+
+  handle('comfy:start', async ({ dir, port }) => {
+    const cfg = config.get();
+    const found = comfy.detect((cfg.comfy && cfg.comfy.dir) || dir);
+    const target = dir || found.dir;
+    if (!target) return { ok: false, error: 'ComfyUI is not installed yet' };
+    const res = await comfyServer.start({
+      dir: target,
+      python: cfg.comfy && cfg.comfy.python,
+      port: port || (cfg.comfy && cfg.comfy.port) || 8188,
+      flavor: cfg.comfy && cfg.comfy.flavor,
+      extraArgs: (cfg.comfy && cfg.comfy.extraArgs) || [],
+    });
+    config.patch({ comfy: { dir: target, port: res.port } });
+    return { ok: true, ...res, status: comfyServer.status() };
+  });
+
+  handle('comfy:stop', async () => { await comfyServer.stop(); return { ok: true, status: comfyServer.status() }; });
+
+  handle('comfy:status', async () => {
+    const stats = comfyServer.state === 'ready' ? await comfyServer.stats().catch(() => null) : null;
+    return { ok: true, status: comfyServer.status(), stats };
+  });
+
+  handle('comfy:open', async ({ inApp }) => {
+    if (comfyServer.state !== 'ready') return { ok: false, error: 'ComfyUI is not running' };
+    if (inApp) {
+      const w = new BrowserWindow({
+        width: 1500, height: 950, backgroundColor: '#0e1116', title: 'ComfyUI',
+        autoHideMenuBar: true,
+        webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+      });
+      w.loadURL(comfyServer.baseUrl);
+      return { ok: true, via: 'window' };
+    }
+    await shell.openExternal(comfyServer.baseUrl);
+    return { ok: true, via: 'browser' };
+  });
+
+  handle('comfy:pickDir', async () => {
+    const r = await dialog.showOpenDialog(win, { title: 'Locate your ComfyUI folder', properties: ['openDirectory'] });
+    if (r.canceled) return { ok: false };
+    const found = comfy.detect(r.filePaths[0]);
+    if (!found.installed) return { ok: false, error: 'that folder has no main.py / comfy directory' };
+    config.patch({ comfy: { dir: found.dir, python: found.python } });
+    return { ok: true, comfy: found };
+  });
 
   /* ----- CLI drivers ----- */
 
@@ -513,8 +736,10 @@ function wireIpc() {
       });
     }
     cliSessions.set(which, session);
+    ensureSession({ kind: which, modelId: null });
     const started = await session.start();
-    return { ok: true, started, status: session.status() };
+    if (which === 'claude' && session.sessionId) sessions.patch(currentSessionId, { cliSessionId: session.sessionId });
+    return { ok: true, started, status: session.status(), sessions: sessions.list() };
   });
 
   handle('cli:send', async ({ agent: which, text }) => {
@@ -573,8 +798,12 @@ if (!singleInstance) {
 
   app.whenReady().then(async () => {
     config = new Config(app.getPath('userData'));
+    sessions = new SessionStore(app.getPath('userData'));
+    const savedSession = config.get().activeSessionId;
+    currentSessionId = savedSession && sessions.load(savedSession) ? savedSession : null;
     hw = await hardware.probe();
     llama = new LlamaServer({ onEvent: emit });
+    comfyServer = new comfy.ComfyServer({ onEvent: emit });
     agent = new LocalAgent({
       getStatus: () => llama.status(),
       onEvent: emit,
@@ -585,10 +814,27 @@ if (!singleInstance) {
         return { ctx: model && model.profile ? model.profile.ctx : 8192, sampling: cfg.sampling };
       },
     });
+    // Restore the previous conversation's model-facing history, so reopening
+    // the app continues the chat instead of only redrawing it.
+    if (currentSessionId) {
+      const s0 = sessions.load(currentSessionId);
+      if (s0 && Array.isArray(s0.agent) && s0.agent.length) agent.messages = s0.agent.slice();
+    }
+
+    monitor = new Monitor({ onSample: (sample) => emit({ type: 'monitor:sample', sample }) });
+    monitor.trackPids(() => {
+      const pids = {};
+      if (llama.proc) pids['llama-server'] = llama.proc.pid;
+      if (comfyServer.proc) pids.comfyui = comfyServer.proc.pid;
+      for (const [name, s2] of cliSessions) { const st = s2.status(); if (st.pid) pids[name] = st.pid; }
+      return pids;
+    });
+    monitor.start();
+
     buildToolCtx();
     wireIpc();
     createWindow();
-    if (process.env.LAGUNA_SMOKE === '1') { await runSmoke(); return; }
+    if (isSmoke) { await runSmoke(); return; }
     createTray();
   });
 
@@ -603,7 +849,10 @@ if (!singleInstance) {
     e.preventDefault();
     clearApprovals('abort');
     try { agent.abort(); } catch (_) { /* nothing running */ }
+    try { persistAgentHistory(); sessions.flushAll(); } catch (_) { /* best effort */ }
+    try { monitor.stop(); } catch (_) { /* not started */ }
     for (const [, s] of cliSessions) { try { await s.stop(); } catch (_) { /* already gone */ } }
+    try { await comfyServer.stop(); } catch (_) { /* already gone */ }
     try { await llama.stop(); } catch (_) { /* already gone */ }
     app.exit(0);
   });

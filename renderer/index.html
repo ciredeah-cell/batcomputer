@@ -19,36 +19,69 @@
             <div class="brand-sub" id="hwLine">probing hardware…</div>
           </div>
         </div>
+        <!-- Live memory, always visible: on a unified-memory box this is the
+             number that decides what you can run. -->
+        <div class="ram-strip" id="ramStrip" title="System memory in use">
+          <canvas id="ramSpark" width="236" height="26"></canvas>
+          <div class="ram-bar"><div class="ram-fill" id="ramFill"></div><div class="ram-model" id="ramModel"></div></div>
+          <div class="ram-legend">
+            <span id="ramText">—</span>
+            <span id="ramModelText"></span>
+          </div>
+        </div>
       </header>
 
-      <section class="rail-section">
-        <div class="rail-title">
-          <span>Local models</span>
-          <button class="icon-btn" id="btnAddModel" title="Add a GGUF model">+</button>
-        </div>
-        <ul class="driver-list" id="modelList"></ul>
-        <button class="ghost-btn" id="btnScanModels">Scan a models folder…</button>
-      </section>
+      <div class="rail-scroll">
+        <section class="rail-section">
+          <div class="rail-title">
+            <span>Local models</span>
+            <button class="icon-btn" id="btnAddModel" title="Add a GGUF model">+</button>
+          </div>
+          <ul class="driver-list" id="modelList"></ul>
+          <button class="ghost-btn wide" id="btnScanModels">Scan a models folder…</button>
+        </section>
 
-      <section class="rail-section">
-        <div class="rail-title"><span>Cloud agents</span></div>
-        <ul class="driver-list" id="cliList">
-          <li class="driver" data-cli="claude">
-            <span class="dot" id="dotClaude"></span>
-            <div class="driver-body">
-              <div class="driver-name">Claude Code</div>
-              <div class="driver-meta" id="metaClaude">checking…</div>
-            </div>
-          </li>
-          <li class="driver" data-cli="copilot">
-            <span class="dot" id="dotCopilot"></span>
-            <div class="driver-body">
-              <div class="driver-name">GitHub Copilot</div>
-              <div class="driver-meta" id="metaCopilot">checking…</div>
-            </div>
-          </li>
-        </ul>
-      </section>
+        <section class="rail-section">
+          <div class="rail-title"><span>Agents</span></div>
+          <ul class="driver-list" id="cliList">
+            <li class="driver" data-cli="claude">
+              <span class="dot" id="dotClaude"></span>
+              <div class="driver-body">
+                <div class="driver-name">Claude Code</div>
+                <div class="driver-meta" id="metaClaude">checking…</div>
+              </div>
+            </li>
+            <li class="driver" data-cli="copilot">
+              <span class="dot" id="dotCopilot"></span>
+              <div class="driver-body">
+                <div class="driver-name">GitHub Copilot</div>
+                <div class="driver-meta" id="metaCopilot">checking…</div>
+              </div>
+            </li>
+          </ul>
+        </section>
+
+        <section class="rail-section">
+          <div class="rail-title"><span>Image</span></div>
+          <ul class="driver-list">
+            <li class="driver" data-cli="comfy" id="comfyRow">
+              <span class="dot" id="dotComfy"></span>
+              <div class="driver-body">
+                <div class="driver-name">ComfyUI</div>
+                <div class="driver-meta" id="metaComfy">checking…</div>
+              </div>
+            </li>
+          </ul>
+        </section>
+
+        <section class="rail-section">
+          <div class="rail-title">
+            <span>Sessions</span>
+            <button class="icon-btn" id="btnNewSession" title="Start a new session">+</button>
+          </div>
+          <ul class="session-list" id="sessionList"></ul>
+        </section>
+      </div>
 
       <section class="rail-section rail-foot">
         <label class="field">
@@ -77,7 +110,7 @@
           <span class="dot" id="activeDot"></span>
           <div>
             <div class="active-name" id="activeName">No driver selected</div>
-            <div class="active-meta" id="activeMeta">Pick a local model, or launch Claude Code or Copilot</div>
+            <div class="active-meta" id="activeMeta">Pick a local model, or launch Claude Code, Copilot or ComfyUI</div>
           </div>
         </div>
         <div class="topbar-actions">
@@ -89,19 +122,79 @@
         </div>
       </header>
 
+      <!-- ORB's status strip: one line of truth about what is happening now. -->
+      <div id="statusStrip">
+        <span class="status-text" id="statusText">Idle</span>
+        <button class="link-btn" id="btnActivity" title="Show recent activity">activity</button>
+      </div>
+
+      <div id="activityPanel" hidden>
+        <div class="activity-head">Activity</div>
+        <pre class="activity-log" id="activityLog"></pre>
+      </div>
+
       <div id="transcript">
         <div class="empty-state" id="emptyState">
           <h1>One deck, every driver.</h1>
           <p>
             Load a GGUF with llama.cpp and the deck plans the offload for you, or hand the turn to
-            Claude Code or GitHub Copilot — same chat, same workspace, same approval rules.
+            Claude Code or GitHub Copilot — same chat, same workspace, same approval rules. ComfyUI
+            rides along for image work.
           </p>
           <ol class="getting-started">
             <li><b>Point it at llama-server</b> — Settings → llama.cpp binary.</li>
             <li><b>Add Laguna XS</b> — the <span class="kbd">+</span> next to Local models, or scan a folder.</li>
-            <li><b>Check the Deck panel</b> — it shows whether the model plus its KV cache fits the graphics carve-out, and what to change if it doesn't.</li>
-            <li><b>Load and talk.</b> Tool calls appear as cards you approve or deny.</li>
+            <li><b>Check the Deck panel</b> — System shows live memory; Budget shows whether the model plus its KV cache fits the graphics carve-out.</li>
+            <li><b>Load and talk.</b> Tool calls appear as cards you approve or deny, and every session is saved.</li>
           </ol>
+        </div>
+      </div>
+
+      <!-- ComfyUI driver view, shown instead of the transcript -->
+      <div id="comfyView" hidden>
+        <div class="comfy-card">
+          <div class="comfy-head">
+            <h2>ComfyUI</h2>
+            <span class="comfy-state" id="comfyState">checking…</span>
+          </div>
+          <p class="comfy-blurb" id="comfyBlurb"></p>
+
+          <div class="comfy-row" id="comfyPathRow">
+            <span class="comfy-label">Folder</span>
+            <button class="path-btn" id="btnComfyDir">—</button>
+          </div>
+          <div class="comfy-row">
+            <span class="comfy-label">Port</span>
+            <input type="number" id="comfyPort" min="1024" max="65535" />
+          </div>
+
+          <div class="comfy-actions">
+            <button class="pill-btn primary" id="btnComfyStart">Start ComfyUI</button>
+            <button class="pill-btn" id="btnComfyOpen">Open in browser</button>
+            <button class="pill-btn" id="btnComfyOpenApp">Open in a deck window</button>
+            <button class="pill-btn danger" id="btnComfyStop">Stop</button>
+          </div>
+
+          <div class="comfy-install" id="comfyInstall" hidden>
+            <h3>Set it up</h3>
+            <p class="hint">
+              The deck will clone ComfyUI, build it a private Python environment, and install the
+              torch build you pick. Nothing is installed system-wide.
+            </p>
+            <div class="comfy-row">
+              <span class="comfy-label">Install to</span>
+              <button class="path-btn" id="btnComfyInstallDir">—</button>
+            </div>
+            <div class="comfy-row">
+              <span class="comfy-label">Acceleration</span>
+              <select id="comfyFlavor"></select>
+            </div>
+            <p class="hint" id="comfyFlavorNote"></p>
+            <button class="pill-btn primary" id="btnComfyInstall">Install ComfyUI</button>
+          </div>
+
+          <div class="comfy-stats" id="comfyStats" hidden></div>
+          <pre class="log comfy-log" id="comfyLog"></pre>
         </div>
       </div>
 
@@ -122,12 +215,32 @@
     <!-- ──────────────────────────── deck panel ─────────────────────── -->
     <aside id="deck">
       <div class="deck-tabs">
-        <button class="tab active" data-tab="budget">Budget</button>
+        <button class="tab active" data-tab="system">System</button>
+        <button class="tab" data-tab="budget">Budget</button>
         <button class="tab" data-tab="profile">Offload</button>
-        <button class="tab" data-tab="log">Server log</button>
+        <button class="tab" data-tab="log">Log</button>
       </div>
 
-      <section class="deck-pane active" data-pane="budget">
+      <section class="deck-pane active" data-pane="system">
+        <div class="gauge-wrap">
+          <div class="gauge-label"><span>System memory</span><span id="sysNums">—</span></div>
+          <div class="gauge">
+            <div class="gauge-fill" id="sysFill"></div>
+            <div class="gauge-model" id="sysModelFill"></div>
+          </div>
+          <canvas id="sysSpark" class="spark" width="300" height="56"></canvas>
+          <div class="meter-key">
+            <span><i class="sw gauge-other"></i>other</span>
+            <span><i class="sw gauge-proc"></i>deck processes</span>
+            <span><i class="sw gauge-free"></i>free</span>
+          </div>
+        </div>
+        <dl class="stat-grid" id="procGrid"></dl>
+        <div id="gpuBlock"></div>
+        <div class="deck-note" id="sysNote"></div>
+      </section>
+
+      <section class="deck-pane" data-pane="budget">
         <div class="meter-wrap">
           <div class="meter-label"><span>GPU memory budget</span><span id="budgetNums">—</span></div>
           <div class="meter" id="meter">
@@ -153,6 +266,10 @@
       </section>
 
       <section class="deck-pane" data-pane="log">
+        <div class="log-switch">
+          <button class="chip active" data-log="llama">llama-server</button>
+          <button class="chip" data-log="comfy">ComfyUI</button>
+        </div>
         <pre id="serverLog" class="log"></pre>
       </section>
     </aside>
